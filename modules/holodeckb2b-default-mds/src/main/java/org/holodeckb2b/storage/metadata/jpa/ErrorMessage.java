@@ -175,7 +175,7 @@ public class ErrorMessage extends MessageUnit {
      */
     @ElementCollection(targetClass = EbmsError.class)
     @CollectionTable(name="ERR_MU_ERRORS",
-                     joinColumns = @JoinColumn(name="ErrorMessage_OID"),
+                     joinColumns = @JoinColumn(name="ERROR_MESSAGE_OID"),
                      foreignKey = @ForeignKey(name="FK_ERR_MU_ERRORS_ERROR_MESSAGE"))
     private List<IEbmsError>       errors;
 

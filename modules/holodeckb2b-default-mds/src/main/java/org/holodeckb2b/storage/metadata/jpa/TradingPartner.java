@@ -144,8 +144,8 @@ public class TradingPartner implements ITradingPartner, Serializable {
      */
     @ElementCollection(targetClass = org.holodeckb2b.storage.metadata.jpa.PartyId.class,
                        fetch = FetchType.EAGER)
-    @CollectionTable(name="TradingPartner_partyIds",
-                     joinColumns = @JoinColumn(name="TradingPartner_OID"),
+    @CollectionTable(name="TRADING_PARTNER_PARTY_IDS",
+                     joinColumns = @JoinColumn(name="TRADING_PARTNER_OID"),
                      foreignKey = @ForeignKey(name="FK_TRADING_PARTNER_PARTY_IDS_TRADING_PARTNER"))
     private Collection<IPartyId>     partyIds;
 

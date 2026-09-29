@@ -213,7 +213,7 @@ public class PayloadInfo implements JPAEntityObject {
     private String				PAYLOAD_ID;
 
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name="parent_OID", foreignKey = @ForeignKey(name="FK_PAYLOAD_USER_MESSAGE"))
+    @JoinColumn(name="PARENT_OID", foreignKey = @ForeignKey(name="FK_PAYLOAD_USER_MESSAGE"))
     private UserMessage			parent;
 
     @Enumerated(EnumType.STRING)

@@ -161,12 +161,12 @@ public class UserMessage extends MessageUnit {
      */
     @OneToMany(cascade = CascadeType.ALL)
     @JoinTable(name="UM_PARTNERS",
-               joinColumns = @JoinColumn(name="UserMessage_OID",
+               joinColumns = @JoinColumn(name="USER_MESSAGE_OID",
                                          foreignKey = @ForeignKey(name="FK_UM_PARTNERS_USER_MESSAGE")),
-               inverseJoinColumns = @JoinColumn(name="partners_OID",
+               inverseJoinColumns = @JoinColumn(name="PARTNERS_OID",
                                                 foreignKey = @ForeignKey(name="FK_UM_PARTNERS_TRADING_PARTNER")),
                uniqueConstraints = @UniqueConstraint(name="UK_UM_PARTNERS_PARTNERS_OID",
-                                                     columnNames = "partners_OID"))
+                                                     columnNames = "PARTNERS_OID"))
     @MapKeyColumn(name="PARTNERTYPE")
     @MapKeyEnumerated(EnumType.STRING)
     private Map<PartnerType, TradingPartner>      partners;
@@ -188,7 +188,7 @@ public class UserMessage extends MessageUnit {
      */
     @ElementCollection(targetClass = Property.class)
     @CollectionTable(name="UM_PROPERTIES",
-                     joinColumns = @JoinColumn(name="UserMessage_OID"),
+                     joinColumns = @JoinColumn(name="USER_MESSAGE_OID"),
                      foreignKey = @ForeignKey(name="FK_UM_PROPERTIES_USER_MESSAGE"))
     private List<IProperty>      properties;
 }

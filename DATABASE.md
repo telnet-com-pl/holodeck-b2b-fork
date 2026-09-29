@@ -1,78 +1,123 @@
-# Baza danych Holodeck B2B 7.0.0 - przewodnik integracyjny
+# Integracja z Holodeck B2B 7.0.0 przez bazę danych i system plików
 
 ## 1. Cel i zakres
 
-Ten dokument opisuje sposob, w jaki ta wersja Holodeck B2B zapisuje i odczytuje dane, oraz kontrakt, ktory powinien przyjac system zewnetrzny czytajacy baze bezposrednio. Opis powstal na podstawie kodu z commita `ee0a17f8` i lokalnego DDL wygenerowanego dla SQL Servera. Stan analizy: 2026-07-22.
+Ten dokument jest źródłem wiedzy dla zespołu, który integruje się z działającą instancją Holodeck B2B wyłącznie przez:
 
-Najwazniejsze ograniczenie: baza zawiera **metadane wiadomosci i payloadow, ale nie zawiera tresci payloadow**. Domyslny `PayloadStorageProvider` zapisuje tresc w systemie plikow. Integracja oparta tylko na SQL nie odtworzy kompletnej wiadomosci biznesowej.
+1. odczyt metadanych z bazy Microsoft SQL Server;
+2. odczyt treści payloadów z uzgodnionego katalogu w systemie plików.
 
-Schemat bazy jest wewnetrznym modelem modulu `holodeckb2b-default-mds`, a nie stabilnym, wersjonowanym publicznym API. Dla zapisu nalezy uzywac interfejsow Holodecka. Bezposredni dostep do SQL powinien byc tylko do odczytu i najlepiej odbywac sie przez kontrolowane widoki integracyjne.
+Do korzystania z dokumentu nie jest potrzebna znajomość kodu, klas ani mechanizmów wewnętrznych Holodecka. Opisane niżej tabele, wartości i kolejność operacji należy traktować jako kontrakt danych dla wersji 7.0.0. Stan analizy: 2026-07-22.
 
-### W skrocie
+Najważniejsza zasada: baza zawiera **metadane wiadomości i payloadów, ale nie zawiera treści payloadów**. Treść znajduje się w systemie plików, a elementem łączącym oba źródła jest `PAYLOAD.PAYLOAD_ID`. Sam odczyt SQL nie wystarcza do odtworzenia kompletnej wiadomości biznesowej.
 
-- Silnik: Microsoft SQL Server, dialekt Hibernate `SQLServer2016Dialect`.
-- ORM: JPA/Hibernate 5.6.15.Final, transakcje `RESOURCE_LOCAL`.
-- Konfiguracja polaczenia: `HB2B_DB_URL`, `HB2B_DB_USER`, `HB2B_DB_PASSWORD`.
-- Schemat nie jest wersjonowany migracjami; Hibernate uruchamia `hbm2ddl.auto=update` przy starcie.
-- Glowny rekord to `MSG_UNIT`; konkretny typ wynika z obecnosci rekordu w tabeli potomnej.
-- Aktualny stan to rekord `MSG_STATE` o najwiekszym `PROC_STATE_NUM` dla danej wiadomosci.
-- `MSG_UNIT.DIRECTION` jest liczba: `0 = IN`, `1 = OUT`. `PAYLOAD.DIRECTION` jest tekstem: `IN` albo `OUT`.
-- `MESSAGE_ID` nie jest unikalny w bazie. Duplikaty przychodzace sa dozwolone; unikalnosc wychodzacych sprawdza aplikacja.
-- `CORE_ID` jest UUID generowanym przez aplikacje, ale baza nie ma ograniczenia `UNIQUE`.
-- Retencja jest domyslnie ustawiona na 30 dni i moze usuwac rekordy niezaleznie od tego, czy stan jest finalny.
-- Klucze obce nie maja `ON DELETE CASCADE`; usuwanie koordynuje Hibernate i warstwa `StorageManager`.
+Integracja opisana w tym dokumencie jest tylko do odczytu. Schemat bazy nie jest publicznym, wersjonowanym API i może zmienić się wraz z aktualizacją Holodecka. Zalecanym punktem dostępu są kontrolowane widoki integracyjne oraz katalog payloadów udostępniony z prawami tylko do odczytu.
 
-## 2. Architektura przechowywania
+### Źródła prawdy
 
-Holodeck rozdziela przechowywanie na dwa providery:
+Dla konkretnego wdrożenia obowiązuje następująca kolejność:
 
-1. `IMetadataStorageProvider` - metadane w SQL Serverze. Domyslna implementacja to `DefaultMetadataStorageProvider`.
-2. `IPayloadStorageProvider` - binarna lub tekstowa tresc dokumentow biznesowych. Domyslna implementacja to `DefaultPayloadStorageProvider`, ktory uzywa systemu plikow.
+1. aktywna baza danych określa faktyczny schemat i dostępne metadane;
+2. aktywna konfiguracja wdrożenia określa właściwy katalog payloadów;
+3. zawartość tego katalogu określa dostępność treści;
+4. ten dokument opisuje sposób korelacji danych i oczekiwane reguły ich interpretacji.
 
-`StorageManager` laczy obie warstwy, ale nie zapewnia jednej transakcji obejmujacej SQL Server i system plikow. W rezultacie chwilowo, a po awarii takze trwale, moze istniec:
+Rozbieżność pomiędzy dokumentem a wdrożeniem należy wyjaśnić przed uruchomieniem lub wznowieniem integracji. Nie wolno zgadywać nazwy schematu ani katalogu na podstawie wartości domyślnych.
 
-- metadana `PAYLOAD` bez odpowiadajacego pliku;
-- plik bez metadanych;
-- wiadomosc w stanie `FAILURE`, gdy zapis metadanych udal sie, a zapis tresci nie.
+### W skrócie
 
-Domyslna lokalizacja tresci to:
+- Źródło metadanych: Microsoft SQL Server.
+- Źródło treści: uzgodniony katalog payloadów w systemie plików.
+- Łącznik: `PAYLOAD.PAYLOAD_ID`, równy nazwie pliku bez rozszerzenia.
+- Główny rekord wiadomości: `MSG_UNIT`; konkretny typ wynika z obecności rekordu w tabeli potomnej.
+- Aktualny stan: rekord `MSG_STATE` o największym `PROC_STATE_NUM` dla danej wiadomości.
+- `MSG_UNIT.DIRECTION` jest liczbą: `0 = IN`, `1 = OUT`. `PAYLOAD.DIRECTION` jest tekstem: `IN` albo `OUT`.
+- `MESSAGE_ID` nie jest unikalny. Integracja musi tolerować wiele rekordów o tej samej wartości.
+- `CORE_ID` identyfikuje instancję wiadomości, ale baza nie wymusza jego unikalności.
+- Zapis i usuwanie w bazie oraz w systemie plików nie są atomowe; integracja musi obsługiwać brakujące i osierocone pliki.
+- Domyślna retencja wynosi 30 dni i może usuwać także wiadomości w stanie niefinalnym.
+- Bezpośrednie modyfikowanie tabel lub plików jest poza kontraktem tej integracji.
+
+## 2. Kontrakt przechowywania
+
+Kompletna wiadomość jest rozdzielona pomiędzy dwa niezależne źródła:
+
+1. **bazę danych** — przechowuje metadane wiadomości, historię stanów, metadane payloadów oraz relacje pomiędzy rekordami;
+2. **system plików** — przechowuje binarną lub tekstową treść payloadów.
+
+Nie istnieje wspólna transakcja obejmująca oba źródła. W rezultacie, chwilowo lub trwale po awarii, może istnieć:
+
+- rekord `PAYLOAD` bez odpowiadającego pliku;
+- plik bez odpowiadającego rekordu `PAYLOAD`;
+- wiadomość w stanie `FAILURE`, jeżeli nie udało się zapisać kompletnego zestawu danych.
+
+Domyślna lokalizacja treści to:
 
 ```text
-<katalog tymczasowy Holodecka>/pldata/<PAYLOAD.PAYLOAD_ID>
+<katalog tymczasowy Holodecka>/pldata/<PAYLOAD_ID>
 ```
 
-Parametr tekstowy `payload-directory` w konfiguracji Holodecka moze ustawic inny katalog. Nazwa pliku jest dokladnie wartoscia `PAYLOAD_ID`, bez rozszerzenia. `PAYLOAD.URI` nie jest sciezka pliku i nie moze sluzyc do jego odnalezienia.
+Wartość `payload-directory` może wskazywać inny katalog. Integracja musi otrzymać jego rzeczywistą wartość od administratora wdrożenia. Nazwa pliku jest dokładnie wartością `PAYLOAD_ID`, bez rozszerzenia. `PAYLOAD.URI` nie jest lokalną ścieżką pliku i nie może służyć do jego odnalezienia.
 
-### Konfiguracja i uruchamianie
+### Relacja bazy danych z systemem plików
 
-Provider wymaga wszystkich trzech zmiennych srodowiskowych:
+Jedynym łącznikiem pomiędzy SQL Serverem a systemem plików jest `PAYLOAD.PAYLOAD_ID`. Nie jest to klucz obcy ani relacja wymuszana przez bazę. Integracja odnajduje treść, używając tej wartości jako nazwy pliku w uzgodnionym katalogu payloadów.
 
-| Zmienna | Znaczenie |
+```mermaid
+flowchart LR
+    MU[(MSG_UNIT)] -->|"OID"| UM[(USER_MESSAGE)]
+    UM -->|"OID = PAYLOAD.PARENT_OID"| PL[(PAYLOAD: metadane)]
+    CFG["konfiguracja: payload-directory"] -->|"katalog bazowy"| FILE["plik: &lt;payload-directory&gt;/&lt;PAYLOAD_ID&gt;"]
+    PL -.->|"PAYLOAD.PAYLOAD_ID = nazwa pliku"| FILE
+```
+
+Dla payloadu należącego do User Message pełna ścieżka korelacji ma postać:
+
+```text
+MSG_UNIT.OID
+  -> USER_MESSAGE.OID
+  -> PAYLOAD.PARENT_OID
+  -> PAYLOAD.PAYLOAD_ID
+  -> <payload-directory>/<PAYLOAD_ID>
+```
+
+| Aspekt | Baza danych | System plików |
+|---|---|---|
+| Identyfikacja | `PAYLOAD.PAYLOAD_ID` | Nazwa pliku równa `PAYLOAD_ID` |
+| Zawartość | Metadane, m.in. rodzic, MIME type, containment i properties | Surowa treść payloadu |
+| Lokalizacja | Katalog bazowy nie jest przechowywany w tabeli `PAYLOAD` | Katalog pochodzi z `payload-directory` albo z domyślnego `<temp>/pldata` |
+| Integralność | `PAYLOAD_ID` jest unikalny w SQL, ale baza nie sprawdza istnienia pliku | System plików nie sprawdza istnienia rekordu `PAYLOAD` |
+
+Docelowo jednemu rekordowi `PAYLOAD` odpowiada jeden plik, ale jest to logiczna relacja `1 : 1`, a nie gwarancja techniczna. Przy zapisie najpierw utrwalane są metadane, a potem treść; przy usuwaniu najpierw usuwany jest plik, a potem metadane. Dlatego integracja oraz procedury backup/restore muszą rozpoznawać oba rodzaje niespójności:
+
+| Rekord `PAYLOAD` | Plik | Interpretacja |
+|:---:|:---:|---|
+| jest | jest | Stan spójny |
+| jest | brak | Metadane bez treści; odczyt payloadu nie powiedzie się |
+| brak | jest | Osierocony plik, którego nie da się powiązać z wiadomością przez SQL |
+
+Relacja nazwa pliku = `PAYLOAD_ID` obowiązuje tylko wtedy, gdy dane wdrożenie udostępnia payloady w opisanym katalogu. Jeżeli treść jest przechowywana w innym magazynie, część dokumentu dotycząca systemu plików nie ma zastosowania i sposób pobierania treści musi zostać uzgodniony oddzielnie.
+
+### Minimalny kontrakt dostępu
+
+Przed uruchomieniem integracja musi otrzymać i zweryfikować:
+
+| Element | Wymagana informacja lub uprawnienie |
 |---|---|
-| `HB2B_DB_URL` | Pelny JDBC URL SQL Servera, lacznie z nazwa bazy i wymaganymi parametrami TLS. |
-| `HB2B_DB_USER` | Login uzywany przez Hibernate. |
-| `HB2B_DB_PASSWORD` | Haslo loginu. |
+| SQL Server | Adres serwera, nazwa bazy, szyfrowane połączenie i konto tylko do odczytu |
+| Schemat SQL | Faktyczna nazwa schematu zawierającego opisane tabele; zwykle `dbo`, ale nie należy tego zakładać |
+| Katalog payloadów | Bezwzględna ścieżka lokalna albo ścieżka udziału sieciowego odpowiadająca tej samej instancji Holodecka |
+| Dostęp do plików | Prawo odczytu plików i listowania katalogu, bez prawa zapisu lub usuwania |
+| Wersja danych | Wersja Holodecka oraz zaakceptowany snapshot schematu bazy |
+| Retencja | Okres retencji bazy i plików oraz sposób informowania o usunięciach |
 
-Brak lub pusta wartosc zatrzymuje inicjalizacje providera. Kod nie ustawia nazwy schematu, dlatego obiekty sa tworzone w domyslnym schemacie uzytkownika bazy, zwykle `dbo`, ale integracja nie powinna tego zakladac bez sprawdzenia.
-
-Istotne ustawienia Hibernate:
-
-| Ustawienie | Wartosc | Skutek |
-|---|---:|---|
-| `hibernate.hbm2ddl.auto` | `update` | Hibernate tworzy i rozszerza schemat podczas startu. Nie jest to pelny mechanizm migracji ani rollbacku. |
-| `hibernate.jdbc.batch_size` | `20` | Zapisy moga byc grupowane po 20 instrukcji. |
-| cache drugiego poziomu | wylaczony | Odczyty nie korzystaja z L2 cache. |
-| query cache | wylaczony | Zapytania trafiaja do bazy. |
-| `show_sql` | `false` | SQL nie jest domyslnie logowany. |
-| typ transakcji | `RESOURCE_LOCAL` | Kazda operacja providera zarzadza lokalna transakcja JPA. Brak JTA. |
-
-Kod konfiguracyjny nie dostarcza `DataSource` ani zewnetrznego poola. Sposob zestawiania polaczen nalezy potwierdzic w konkretnej dystrybucji i monitorowac po stronie SQL Servera.
+Zmienne `HB2B_DB_URL`, `HB2B_DB_USER` i `HB2B_DB_PASSWORD` opisują połączenie używane przez Holodeck, ale konto integracyjne powinno być odrębne i mieć wyłącznie prawa odczytu. Schemat może zostać rozszerzony podczas aktualizacji lub startu aplikacji, dlatego integracja nie może traktować samej wersji dokumentu jako dowodu stanu aktywnej bazy.
 
 ## 3. Model logiczny
 
-### Dziedziczenie typow wiadomosci
+### Rozpoznawanie typów wiadomości
 
-JPA uzywa strategii `JOINED`. Kazdy typ ma rekord w `MSG_UNIT` i rekord z tym samym `OID` w tabeli potomnej:
+Typ wiadomości nie jest zapisany w jednej kolumnie. Każdy typ ma rekord w `MSG_UNIT` oraz rekord z tym samym `OID` w odpowiedniej tabeli potomnej:
 
 | Typ logiczny | Wymagane rekordy |
 |---|---|
@@ -82,208 +127,208 @@ JPA uzywa strategii `JOINED`. Kazdy typ ma rekord w `MSG_UNIT` i rekord z tym sa
 | Pull Request | `MSG_UNIT` + `PULLREQUEST`, bez `SELECTPULLREQUEST` |
 | Selective Pull Request | `MSG_UNIT` + `PULLREQUEST` + `SELECTPULLREQUEST` |
 
-Nie ma kolumny discriminatora. Adnotacje `@DiscriminatorValue` nie tworza w tym schemacie kolumny typu. Przy klasyfikacji trzeba najpierw sprawdzac `SELECTPULLREQUEST`, a dopiero potem zwykly `PULLREQUEST`.
+Nie ma kolumny discriminatora. Integracja rozpoznaje typ na podstawie obecności rekordów w tabelach potomnych. Należy najpierw sprawdzić `SELECTPULLREQUEST`, a dopiero potem zwykły `PULLREQUEST`.
 
 ### Diagram ER
 
 ```mermaid
 erDiagram
-    MSG_UNIT ||--o{ MSG_STATE : "historia stanow"
+    MSG_UNIT ||--o{ MSG_STATE : "historia stanów"
     MSG_UNIT ||--o| USER_MESSAGE : "typ: User Message"
     MSG_UNIT ||--o| ERROR_MESSAGE : "typ: Error Signal"
     MSG_UNIT ||--o| RECEIPT : "typ: Receipt"
     MSG_UNIT ||--o| PULLREQUEST : "typ: Pull Request"
     PULLREQUEST ||--o| SELECTPULLREQUEST : "rozszerzenie selective"
 
-    USER_MESSAGE ||--o{ PAYLOAD : "parent_OID"
+    USER_MESSAGE ||--o{ PAYLOAD : "PARENT_OID"
     USER_MESSAGE ||--o{ UM_PROPERTIES : "properties"
     USER_MESSAGE ||--o{ UM_PARTNERS : "sender/receiver"
-    UM_PARTNERS }o--|| TradingPartner : "partners_OID"
-    TradingPartner ||--o{ TradingPartner_partyIds : "partyIds"
+    UM_PARTNERS }o--|| TradingPartner : "PARTNERS_OID"
+    TradingPartner ||--o{ TRADING_PARTNER_PARTY_IDS : "partyIds"
     PAYLOAD ||--o{ PL_PROPERTIES : "properties"
     ERROR_MESSAGE ||--o{ ERR_MU_ERRORS : "errors"
 ```
 
-W diagramie `o|` przy tabelach potomnych oznacza relacje wynikajaca z modelu. Baza nie ma ograniczenia, ktore wymusza dokladnie jeden typ potomny dla kazdego `MSG_UNIT` ani zabrania sprzecznych rekordow kilku typow.
+W diagramie `o|` przy tabelach potomnych oznacza relację oczekiwaną przez kontrakt. Baza nie ma ograniczenia, które wymusza dokładnie jeden typ potomny dla każdego `MSG_UNIT` ani zabrania sprzecznych rekordów kilku typów.
 
 ### Identyfikatory
 
 | Identyfikator | Zakres i semantyka |
 |---|---|
-| `OID` | Techniczny `bigint`, klucz encji JPA. Generowany ze wspolnej sekwencji `hibernate_sequence`. Nie nalezy wystawiac go jako trwale publiczne ID poza integracja z ta konkretna baza. |
-| `CORE_ID` | UUID generowany przez Holodeck dla kazdej wiadomosci. Najlepszy identyfikator techniczny do korelacji z API Holodecka. Brak `UNIQUE`/`NOT NULL` w bazie. |
-| `MESSAGE_ID` | Identyfikator ebMS widoczny w protokole. Moze wystepowac wiele razy, szczegolnie dla `DIRECTION=IN`, gdzie duplikaty sa celowo wykrywane w logice aplikacji. |
-| `PAYLOAD_ID` | UUID metadanych/tresci payloadu. Jedyna kolumna biznesowa z wymuszona unikalnoscia w DDL. Jest tez nazwa pliku w domyslnym PSP. |
-| `PMODE_ID` | ID P-Mode wybranego przez runtime. To logiczne odwolanie do konfiguracji poza baza; brak tabeli i FK. |
+| `OID` | Techniczny `bigint` używany do tworzenia relacji wewnątrz tej bazy. Nie należy wystawiać go jako trwałego identyfikatora poza integracją z konkretną instancją bazy. |
+| `CORE_ID` | UUID instancji wiadomości. Jest najlepszym identyfikatorem do korelacji rekordów jednej wiadomości, ale baza nie ma ograniczeń `UNIQUE` ani `NOT NULL`. |
+| `MESSAGE_ID` | Identyfikator ebMS widoczny w protokole. Może występować wiele razy, szczególnie dla `DIRECTION=IN`. |
+| `PAYLOAD_ID` | UUID łączący metadane payloadu z jego treścią. Jest unikalny w bazie i stanowi nazwę pliku w katalogu payloadów. |
+| `PMODE_ID` | ID P-Mode wybranego do przetwarzania. To logiczne odwołanie do konfiguracji poza bazą; brak tabeli i FK. |
 
-`hibernate_sequence` jest wspolna dla `MSG_UNIT`, `PAYLOAD` i `TradingPartner`, dlatego przerwy i przeplatanie wartosci `OID` sa normalne. Nie wolno zakladac ciaglosci ani liczby rekordow na podstawie roznicy identyfikatorow.
+Wartości `OID` dla `MSG_UNIT`, `PAYLOAD` i `TradingPartner` pochodzą ze wspólnej sekwencji, dlatego przerwy i przeplatanie wartości są normalne. Nie wolno zakładać ciągłości ani liczby rekordów na podstawie różnicy identyfikatorów.
 
 ## 4. Model stanu przetwarzania
 
-Stan nie jest nadpisywany w `MSG_UNIT`. Kazda zmiana dodaje element do kolekcji `MSG_STATE`:
+Stan nie jest nadpisywany w `MSG_UNIT`. Każda zmiana dodaje element do kolekcji `MSG_STATE`:
 
-- `PROC_STATE_NUM` zaczyna sie od `0` i rosnie o 1 w ramach jednego `MSGUNIT_OID`;
-- `START` jest czasem utworzenia stanu w JVM;
-- `DESCRIPTION` jest obcinany przez aplikacje do 255 znakow;
-- aktualny stan to wiersz o najwiekszym `PROC_STATE_NUM`, nie najwiekszym `START`;
-- kolejnosc globalna pomiedzy wiadomosciami nie istnieje.
+- `PROC_STATE_NUM` zaczyna się od `0` i rośnie o 1 w ramach jednego `MSGUNIT_OID`;
+- `START` jest czasem nadanym przez zegar instancji Holodecka, a nie przez SQL Server;
+- `DESCRIPTION` ma maksymalnie 255 znaków;
+- aktualny stan to wiersz o największym `PROC_STATE_NUM`, nie największym `START`;
+- kolejność globalna pomiędzy wiadomościami nie istnieje.
 
-W poprawnych danych para `(MSGUNIT_OID, PROC_STATE_NUM)` jest logicznie unikalna, ale DDL nie ma dla niej `PRIMARY KEY` ani `UNIQUE`. Integracja powinna monitorowac naruszenia tej reguly. Zapytania samego Holodecka uzywaja `MAX(PROC_STATE_NUM)` i przy duplikacie moga zwrocic wiecej niz jeden aktualny stan.
+W poprawnych danych para `(MSGUNIT_OID, PROC_STATE_NUM)` jest logicznie unikalna, ale DDL nie ma dla niej `PRIMARY KEY` ani `UNIQUE`. Integracja powinna monitorować naruszenia tej reguły. Przy duplikacie najwyższego numeru stanu zwykłe zapytanie z `MAX(PROC_STATE_NUM)` może zwrócić więcej niż jeden aktualny stan.
 
-### Wartosci `STATE`
+### Wartości `STATE`
 
-Kolumna przechowuje tekstowa nazwe enuma, z zachowaniem wielkich liter:
+Kolumna przechowuje tekstową wartość z poniższej listy, z zachowaniem wielkich liter:
 
 | Stan | Finalny | Znaczenie integracyjne |
 |---|:---:|---|
-| `SUBMITTED` | nie | Wiadomosc uzytkownika lub Pull Request przyjety do wyslania. |
-| `CREATED` | nie | Signal utworzony wewnetrznie przez Holodeck. |
-| `RECEIVED` | nie | Pierwszy stan odebranej wiadomosci. |
-| `AWAITING_PULL` | nie | Wiadomosc czeka na pobranie przez drugi MSH. |
-| `READY_TO_PUSH` | nie | Wiadomosc gotowa do wyslania push. |
+| `SUBMITTED` | nie | Wiadomość użytkownika lub Pull Request przyjęty do wysłania. |
+| `CREATED` | nie | Signal utworzony wewnętrznie przez Holodeck. |
+| `RECEIVED` | nie | Pierwszy stan odebranej wiadomości. |
+| `AWAITING_PULL` | nie | Wiadomość czeka na pobranie przez drugi MSH. |
+| `READY_TO_PUSH` | nie | Wiadomość gotowa do wysłania push. |
 | `PROCESSING` | nie | Trwa przetwarzanie. |
-| `SENDING` | nie | Trwa transfer do drugiego MSH. Kazde wystapienie liczy sie jako proba transmisji. |
-| `TRANSPORT_FAILURE` | nie | Problem transportowy; mozliwa dalsza obsluga/retry. |
+| `SENDING` | nie | Trwa transfer do drugiego MSH. Każde wystąpienie liczy się jako próba transmisji. |
+| `TRANSPORT_FAILURE` | nie | Problem transportowy; możliwa dalsza obsługa/retry. |
 | `AWAITING_RECEIPT` | nie | Oczekiwanie na Receipt. |
 | `READY_FOR_DELIVERY` | nie | Gotowe do dostarczenia/notyfikacji aplikacji biznesowej. |
 | `OUT_FOR_DELIVERY` | nie | Trwa dostarczenie/notyfikacja. |
-| `DELIVERY_FAILED` | nie | Proba dostarczenia nie udala sie. |
-| `WARNING` | nie | Ostrzezenie niekonczace przetwarzania. |
+| `DELIVERY_FAILED` | nie | Próba dostarczenia nie udała się. |
+| `WARNING` | nie | Ostrzeżenie niekończące przetwarzania. |
 | `SUSPENDED` | nie | Przetwarzanie wstrzymane, potencjalnie do wznowienia. |
 | `DELIVERED` | tak | User Message dostarczony do MSH lub aplikacji biznesowej. |
-| `DONE` | tak | Signal zakonczony poprawnie. |
+| `DONE` | tak | Signal zakończony poprawnie. |
 | `FAILURE` | tak | Trwale niepowodzenie przetwarzania. |
 | `DUPLICATE` | tak | Odebrany User Message uznany za duplikat. |
 
-Nie nalezy wyprowadzac sukcesu tylko z faktu, ze stan jest finalny. `FAILURE` i `DUPLICATE` sa finalne, ale nie oznaczaja sukcesu biznesowego.
+Nie należy wyprowadzać sukcesu tylko z faktu, że stan jest finalny. `FAILURE` i `DUPLICATE` są finalne, ale nie oznaczają sukcesu biznesowego.
 
-## 5. Slownik tabel i kolumn
+## 5. Słownik tabel i kolumn
 
-Typy ponizej odpowiadaja DDL wygenerowanemu przez biezace mapowania dla SQL Servera. Poniewaz aplikacja uzywa automatycznego `update`, rzeczywista instancja moze miec dodatkowe stare kolumny, inne nazwy dawnych constraintow albo recznie dodane indeksy. Przed wdrozeniem integracji trzeba porownac katalog systemowy z tym dokumentem.
+Poniższy słownik opisuje referencyjny schemat SQL Servera dla analizowanej wersji. Rzeczywista instancja może mieć dodatkowe starsze kolumny, inne nazwy constraintów albo ręcznie dodane indeksy. Przed wdrożeniem integracji trzeba porównać katalog systemowy z tym dokumentem za pomocą zapytań z sekcji 13.
 
-`NULL` w kolumnie "Wymagane" oznacza, ze baza dopuszcza `NULL`, nawet jesli specyfikacja ebMS lub kod oczekuje wartosci.
+`NULL` w kolumnie „Wymagane” oznacza, że baza dopuszcza `NULL`, nawet jeżeli znaczenie biznesowe pola sugeruje wartość obowiązkową.
 
 ### `MSG_UNIT`
 
-Wspolna czesc kazdej wiadomosci.
+Wspólna część każdej wiadomości.
 
 | Kolumna | Typ SQL | Wymagane | Znaczenie |
 |---|---|:---:|---|
 | `OID` | `bigint` | PK | Techniczny klucz z `hibernate_sequence`. |
-| `VERSION` | `bigint` | tak | Licznik blokady optymistycznej JPA. Zwieksza sie przy aktualizacji encji; nie jest globalnym numerem zmiany. |
+| `VERSION` | `bigint` | tak | Lokalny licznik zmian jednego `MSG_UNIT`. Zwiększa się przy aktualizacji; nie jest globalnym numerem zmiany ani offsetem do odczytu przyrostowego. |
 | `CORE_ID` | `varchar(255)` | NULL | UUID nadany przez Holodeck. |
-| `DIRECTION` | `int` | NULL | Enum porzadkowy: `0=IN`, `1=OUT`. Inne wartosci sa nieprawidlowe. |
+| `DIRECTION` | `int` | NULL | Kod liczbowy: `0=IN`, `1=OUT`. Inne wartości są nieprawidłowe. |
 | `MESSAGE_ID` | `varchar(255)` | NULL | ebMS MessageId; nie jest unikalny. |
-| `MU_TIMESTAMP` | `datetime2` | NULL | Czas wiadomosci. Bez informacji o strefie czasowej. |
+| `MU_TIMESTAMP` | `datetime2` | NULL | Czas wiadomości. Bez informacji o strefie czasowej. |
 | `PMODE_ID` | `varchar(255)` | NULL | P-Mode wybrany do przetwarzania. |
-| `REF_TO_MSG_ID` | `varchar(255)` | NULL | Logiczne odwolanie do `MESSAGE_ID`, bez FK. |
-| `USES_MULTI_HOP` | `bit` | tak | Flaga multi-hop. Aplikacja inicjalizuje `false`; DDL nie definiuje `DEFAULT`. |
+| `REF_TO_MSG_ID` | `varchar(255)` | NULL | Logiczne odwołanie do `MESSAGE_ID`, bez FK. |
+| `USES_MULTI_HOP` | `bit` | tak | Flaga multi-hop. Oczekiwana wartość początkowa to `false`; DDL nie definiuje `DEFAULT`. |
 
-`DIRECTION`, `MESSAGE_ID`, `CORE_ID` i `PMODE_ID` maja duze znaczenie domenowe, ale ich poprawnosc nie jest wymuszana constraintami.
+`DIRECTION`, `MESSAGE_ID`, `CORE_ID` i `PMODE_ID` mają duże znaczenie domenowe, ale ich poprawność nie jest wymuszana constraintami.
 
 ### `MSG_STATE`
 
-Historia stanow wszystkich typow wiadomosci.
+Historia stanów wszystkich typów wiadomości.
 
 | Kolumna | Typ SQL | Wymagane | Znaczenie |
 |---|---|:---:|---|
 | `MSGUNIT_OID` | `bigint` | FK | Odbiorca historii, FK do `MSG_UNIT.OID`. |
-| `PROC_STATE_NUM` | `int` | tak | Numer 0-based w ramach wiadomosci. |
-| `STATE` | `varchar(255)` | NULL | Tekstowa wartosc `ProcessingState`. |
-| `START` | `datetime2` | NULL | Poczatek stanu wedlug zegara JVM. |
+| `PROC_STATE_NUM` | `int` | tak | Numer kolejny w ramach wiadomości, liczony od `0`. |
+| `STATE` | `varchar(255)` | NULL | Tekstowa wartość `ProcessingState`. |
+| `START` | `datetime2` | NULL | Początek stanu według zegara instancji Holodecka, a nie SQL Servera. |
 | `DESCRIPTION` | `varchar(255)` | NULL | Dodatkowy opis diagnostyczny. |
 
-Brak klucza glownego i indeksu w bazowym DDL. Hibernate laduje kolekcje eager i sortuje po `PROC_STATE_NUM`.
+Brak klucza głównego i indeksu w bazowym DDL. Integracja musi zawsze jawnie sortować historię po `PROC_STATE_NUM`.
 
 ### `USER_MESSAGE`
 
-Dane ebMS User Message. `OID` jest jednoczesnie PK i FK do `MSG_UNIT.OID`.
+Dane ebMS User Message. `OID` jest jednocześnie PK i FK do `MSG_UNIT.OID`.
 
 | Kolumna | Typ SQL | Wymagane | Znaczenie |
 |---|---|:---:|---|
-| `OID` | `bigint` | PK/FK | Wspolny identyfikator z `MSG_UNIT`. |
-| `MPC` | `varchar(max)` | NULL | Message Partition Channel. Domyslna wartosc aplikacyjna: `http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/defaultMPC`. |
+| `OID` | `bigint` | PK/FK | Wspólny identyfikator z `MSG_UNIT`. |
+| `MPC` | `varchar(max)` | NULL | Message Partition Channel. Domyślna wartość aplikacyjna: `http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/defaultMPC`. |
 | `CI_ACTION` | `varchar(max)` | NULL | `CollaborationInfo/Action`. |
 | `CONVERSATION_ID` | `varchar(max)` | NULL | Identyfikator konwersacji biznesowej. |
 | `S_NAME` | `varchar(max)` | NULL | Nazwa serwisu. |
 | `S_TYPE` | `varchar(max)` | NULL | Typ serwisu. |
 | `A_NAME` | `varchar(255)` | NULL | Nazwa AgreementRef. |
 | `A_TYPE` | `varchar(255)` | NULL | Typ AgreementRef. |
-| `P_MODE_ID` | `varchar(255)` | NULL | P-Mode ID zawarty w AgreementRef. Nie mylic z `MSG_UNIT.PMODE_ID`. |
+| `P_MODE_ID` | `varchar(255)` | NULL | P-Mode ID zawarty w AgreementRef. Nie mylić z `MSG_UNIT.PMODE_ID`. |
 
-`MSG_UNIT.PMODE_ID` opisuje runtime Holodecka. `USER_MESSAGE.P_MODE_ID` jest czescia danych protokolowych AgreementRef i moze byc puste lub miec inna wartosc.
+`MSG_UNIT.PMODE_ID` opisuje P-Mode użyty do przetwarzania przez instancję Holodecka. `USER_MESSAGE.P_MODE_ID` jest częścią danych protokołowych AgreementRef i może być puste lub mieć inną wartość.
 
 ### `UM_PARTNERS`
 
-Tabela laczaca User Message z osobnymi encjami nadawcy i odbiorcy.
+Tabela łącząca User Message z osobnymi encjami nadawcy i odbiorcy.
 
 | Kolumna | Typ SQL | Wymagane | Znaczenie |
 |---|---|:---:|---|
-| `UserMessage_OID` | `bigint` | PK/FK | FK do `USER_MESSAGE.OID`. |
+| `USER_MESSAGE_OID` | `bigint` | PK/FK | FK do `USER_MESSAGE.OID`. |
 | `PARTNERTYPE` | `varchar(255)` | PK | `SENDER` lub `RECEIVER`. |
-| `partners_OID` | `bigint` | FK/UNIQUE | FK do `TradingPartner.OID`; partner nalezy tylko do jednej wiadomosci. |
+| `PARTNERS_OID` | `bigint` | FK/UNIQUE | FK do `TradingPartner.OID`; partner należy tylko do jednej wiadomości. |
 
-PK `(UserMessage_OID, PARTNERTYPE)` wymusza maksymalnie jednego partnera dla danego tekstowego typu, ale CHECK nie ogranicza wartosci do `SENDER`/`RECEIVER`.
+PK `(USER_MESSAGE_OID, PARTNERTYPE)` wymusza maksymalnie jednego partnera dla danego tekstowego typu, ale CHECK nie ogranicza wartości do `SENDER`/`RECEIVER`.
 
 ### `TradingPartner`
 
-Instancja partnera jest prywatna dla jednej wiadomosci, nawet gdy ten sam podmiot wystepuje w wielu wiadomosciach.
+Instancja partnera jest prywatna dla jednej wiadomości, nawet gdy ten sam podmiot występuje w wielu wiadomościach.
 
 | Kolumna | Typ SQL | Wymagane | Znaczenie |
 |---|---|:---:|---|
 | `OID` | `bigint` | PK | Techniczny klucz z `hibernate_sequence`. |
 | `TP_ROLE` | `varchar(max)` | NULL | Rola ebMS Party. |
 
-Nie nalezy traktowac `TradingPartner` jako kartoteki kontrahentow ani laczyc rekordow po `OID` pomiedzy wiadomosciami.
+Nie należy traktować `TradingPartner` jako kartoteki kontrahentów ani łączyć rekordów po `OID` pomiędzy wiadomościami.
 
-### `TradingPartner_partyIds`
+### `TRADING_PARTNER_PARTY_IDS`
 
-Lista identyfikatorow partnera.
+Lista identyfikatorów partnera.
 
 | Kolumna | Typ SQL | Wymagane | Znaczenie |
 |---|---|:---:|---|
-| `TradingPartner_OID` | `bigint` | FK | FK do `TradingPartner.OID`. |
+| `TRADING_PARTNER_OID` | `bigint` | FK | FK do `TradingPartner.OID`. |
 | `P_ID` | `varchar(max)` | NULL | Identyfikator PartyId. Domenowo wymagany, ale nie przez DDL. |
 | `P_TYPE` | `varchar(max)` | NULL | Typ PartyId. |
 
-Brak PK, kolejnosci i ograniczenia duplikatow.
+Brak PK, kolejności i ograniczenia duplikatów.
 
 ### `UM_PROPERTIES`
 
-Dowolne wlasciwosci User Message.
+Dowolne właściwości User Message.
 
 | Kolumna | Typ SQL | Wymagane | Znaczenie |
 |---|---|:---:|---|
-| `UserMessage_OID` | `bigint` | FK | FK do `USER_MESSAGE.OID`. |
+| `USER_MESSAGE_OID` | `bigint` | FK | FK do `USER_MESSAGE.OID`. |
 | `NAME` | `varchar(max)` | NULL | Nazwa property. |
-| `VALUE` | `varchar(max)` | NULL | Wartosc property. |
-| `TYPE` | `varchar(max)` | NULL | Opcjonalny typ wartosci. |
+| `VALUE` | `varchar(max)` | NULL | Wartość property. |
+| `TYPE` | `varchar(max)` | NULL | Opcjonalny typ wartości. |
 
-Nazwa nie jest unikalna; poprawna wiadomosc moze miec wiele property o tej samej nazwie. Brak gwarantowanej kolejnosci.
+Nazwa nie jest unikalna; poprawna wiadomość może mieć wiele property o tej samej nazwie. Brak gwarantowanej kolejności.
 
 ### `PAYLOAD`
 
-Metadane payloadu. Rekord moze istniec samodzielnie przed podpieciem do User Message.
+Metadane payloadu. Rekord może istnieć samodzielnie przed podpięciem do User Message.
 
 | Kolumna | Typ SQL | Wymagane | Znaczenie |
 |---|---|:---:|---|
 | `OID` | `bigint` | PK | Techniczny klucz. |
-| `PAYLOAD_ID` | `varchar(255)` | UNIQUE, NULL | UUID i klucz do tresci w PSP. SQL Server pozwala na maksymalnie jeden `NULL` w zwyklym indeksie unique. Normalny kod zawsze generuje UUID. |
-| `parent_OID` | `bigint` | NULL/FK | FK do `USER_MESSAGE.OID`; `NULL` dla payloadu zlozonego osobno. |
-| `DIRECTION` | `varchar(255)` | NULL | `IN`/`OUT` dla payloadu samodzielnego. Dla podpietego payloadu wartosc efektywna pochodzi z rodzica. |
-| `PMODE_ID` | `varchar(255)` | NULL | P-Mode payloadu samodzielnego. Dla podpietego payloadu wartosc efektywna pochodzi z rodzica. |
+| `PAYLOAD_ID` | `varchar(255)` | UNIQUE, NULL | UUID i klucz do treści w systemie plików. SQL Server pozwala na maksymalnie jeden `NULL` w zwykłym indeksie unique. W poprawnych danych operacyjnych oczekiwany jest UUID. |
+| `PARENT_OID` | `bigint` | NULL/FK | FK do `USER_MESSAGE.OID`; `NULL` dla payloadu złożonego osobno. |
+| `DIRECTION` | `varchar(255)` | NULL | `IN`/`OUT` dla payloadu samodzielnego. Dla podpiętego payloadu wartość efektywna pochodzi z rodzica. |
+| `PMODE_ID` | `varchar(255)` | NULL | P-Mode payloadu samodzielnego. Dla podpiętego payloadu wartość efektywna pochodzi z rodzica. |
 | `CONTAINMENT` | `varchar(255)` | NULL | `BODY`, `ATTACHMENT` albo `EXTERNAL`. |
-| `URI` | `varchar(255)` | NULL | URI payloadu w kontekscie wiadomosci; nie lokalna sciezka. |
-| `MIME_TYPE` | `varchar(255)` | NULL | MIME type, jezeli byl dostepny. |
-| `DESCRIPTION` | `varchar(max)` | NULL | Przestarzaly opis payloadu, maks. 10000 znakow w kodzie. |
-| `LANG` | `varchar(255)` | NULL | Jezyk opisu. |
+| `URI` | `varchar(255)` | NULL | URI payloadu w kontekście wiadomości; nie lokalna ścieżka. |
+| `MIME_TYPE` | `varchar(255)` | NULL | Typ MIME, jeżeli był dostępny. |
+| `DESCRIPTION` | `varchar(max)` | NULL | Przestarzały opis payloadu; wartości tworzone przez Holodeck mają maksymalnie 10000 znaków. |
+| `LANG` | `varchar(255)` | NULL | Język opisu. |
 | `LOCATION` | `varchar(max)` | NULL | Lokalizacja schematu dokumentu. |
 | `NAMESPACE` | `varchar(max)` | NULL | Namespace schematu. |
 | `VERSION` | `varchar(max)` | NULL | Wersja schematu dokumentu; to nie jest licznik blokady. |
 
-`PAYLOAD` nie ma kolumny JPA `@Version`. Aktualizacje metadanych payloadu nie maja takiej ochrony optymistycznej jak `MSG_UNIT` i w praktyce moga zachowywac sie jak last-write-wins.
+`PAYLOAD` nie ma licznika zmian odpowiadającego `MSG_UNIT.VERSION`. Nie należy więc używać tej tabeli samodzielnie do wykrywania wszystkich aktualizacji; równoległe zmiany mogą mieć semantykę last-write-wins.
 
-Efektywne wartosci odczytywane przez kod:
+Integracja musi wyliczać wartości efektywne według następującej reguły:
 
 ```text
 effective direction = parent exists ? MSG_UNIT.DIRECTION : PAYLOAD.DIRECTION
@@ -293,45 +338,45 @@ parent core ID      = parent exists ? MSG_UNIT.CORE_ID    : NULL
 
 ### `PL_PROPERTIES`
 
-Dowolne wlasciwosci payloadu.
+Dowolne właściwości payloadu.
 
 | Kolumna | Typ SQL | Wymagane | Znaczenie |
 |---|---|:---:|---|
 | `PAYLOAD_OID` | `bigint` | FK | FK do `PAYLOAD.OID`. |
 | `NAME` | `varchar(max)` | NULL | Nazwa property. |
-| `VALUE` | `varchar(max)` | NULL | Wartosc property. |
-| `TYPE` | `varchar(max)` | NULL | Opcjonalny typ wartosci. |
+| `VALUE` | `varchar(max)` | NULL | Wartość property. |
+| `TYPE` | `varchar(max)` | NULL | Opcjonalny typ wartości. |
 
-Brak PK, kolejnosci i ograniczenia duplikatow.
+Brak PK, kolejności i ograniczenia duplikatów.
 
 ### `ERROR_MESSAGE`
 
-Naglowek Error Signal. `OID` jest PK i FK do `MSG_UNIT.OID`.
+Nagłówek Error Signal. `OID` jest PK i FK do `MSG_UNIT.OID`.
 
 | Kolumna | Typ SQL | Wymagane | Znaczenie |
 |---|---|:---:|---|
-| `OID` | `bigint` | PK/FK | Wspolny identyfikator z `MSG_UNIT`. |
-| `ADD_SOAP_FAULT` | `bit` | tak | Czy signal powinien byc polaczony z SOAP Fault; ostateczna decyzja zalezy tez od pakowania. |
-| `LEG` | `varchar(255)` | NULL | `REQUEST` albo `REPLY`; moze byc `NULL` dla one-way MEP lub braku dopasowania. |
+| `OID` | `bigint` | PK/FK | Wspólny identyfikator z `MSG_UNIT`. |
+| `ADD_SOAP_FAULT` | `bit` | tak | Czy signal powinien być połączony z SOAP Fault; ostateczna decyzja zależy też od pakowania. |
+| `LEG` | `varchar(255)` | NULL | `REQUEST` albo `REPLY`; może być `NULL` dla one-way MEP lub braku dopasowania. |
 
 ### `ERR_MU_ERRORS`
 
-Poszczegolne bledy ebMS nalezace do Error Signal.
+Poszczególne błędy ebMS należące do Error Signal.
 
 | Kolumna | Typ SQL | Wymagane | Znaczenie |
 |---|---|:---:|---|
-| `ErrorMessage_OID` | `bigint` | FK | FK do `ERROR_MESSAGE.OID`. |
-| `ERROR_CODE` | `varchar(255)` | NULL | Kod bledu, domenowo wymagany. |
-| `SEVERITY` | `varchar(255)` | NULL | Dokladnie `warning` albo `failure` - male litery. |
-| `ERROR_MESSAGE` | `varchar(max)` | NULL | Krotki opis, do 1024 znakow wedlug mapowania. |
-| `ERROR_DETAIL` | `varchar(max)` | NULL | Szczegoly, do 10000 znakow wedlug mapowania. |
-| `ORIGIN` | `varchar(255)` | NULL | Modul pochodzenia bledu. |
-| `CATEGORY` | `varchar(255)` | NULL | Kategoria bledu. |
-| `REF_TO_MSG_IN_ERROR` | `varchar(255)` | NULL | MessageId powodujacy blad; brak FK. |
-| `DESCRIPTION_LANG` | `varchar(255)` | NULL | Jezyk dlugiego opisu. |
-| `DESCRIPTION_TXT` | `varchar(max)` | NULL | Dlugi opis, do 10000 znakow wedlug mapowania. |
+| `ERROR_MESSAGE_OID` | `bigint` | FK | FK do `ERROR_MESSAGE.OID`. |
+| `ERROR_CODE` | `varchar(255)` | NULL | Kod błędu, domenowo wymagany. |
+| `SEVERITY` | `varchar(255)` | NULL | Dokładnie `warning` albo `failure` - małe litery. |
+| `ERROR_MESSAGE` | `varchar(max)` | NULL | Krótki opis, do 1024 znaków według mapowania. |
+| `ERROR_DETAIL` | `varchar(max)` | NULL | Szczegóły, do 10000 znaków według mapowania. |
+| `ORIGIN` | `varchar(255)` | NULL | Moduł pochodzenia błędu. |
+| `CATEGORY` | `varchar(255)` | NULL | Kategoria błędu. |
+| `REF_TO_MSG_IN_ERROR` | `varchar(255)` | NULL | MessageId powodujący błąd; brak FK. |
+| `DESCRIPTION_LANG` | `varchar(255)` | NULL | Język długiego opisu. |
+| `DESCRIPTION_TXT` | `varchar(max)` | NULL | Długi opis, do 10000 znaków według mapowania. |
 
-Brak PK i kolumny porzadku. SQL nie gwarantuje kolejnosci bledow.
+Brak PK i kolumny porządku. SQL nie gwarantuje kolejności błędów.
 
 ### `RECEIPT`
 
@@ -339,10 +384,10 @@ Receipt Signal. `OID` jest PK i FK do `MSG_UNIT.OID`.
 
 | Kolumna | Typ SQL | Wymagane | Znaczenie |
 |---|---|:---:|---|
-| `OID` | `bigint` | PK/FK | Wspolny identyfikator z `MSG_UNIT`. |
-| `CONTENT` | `varchar(max)` | NULL | Fragmenty XML Receipt opakowane przez aplikacje w sztuczny element `<receipt_content>`. |
+| `OID` | `bigint` | PK/FK | Wspólny identyfikator z `MSG_UNIT`. |
+| `CONTENT` | `varchar(max)` | NULL | Fragmenty XML Receipt opakowane przez aplikację w sztuczny element `<receipt_content>`. |
 
-`CONTENT` jest serializowanym XML-em, a nie pojedynczym elementem Receipt. Parser integracji powinien obsluzyc wrapper i wiele dzieci. Kod deklaruje limit 65535 znakow, ale SQL Server przechowuje `varchar(max)`.
+`CONTENT` jest serializowanym XML-em, a nie pojedynczym elementem Receipt. Parser integracji powinien obsłużyć wrapper i wiele dzieci. Wartości tworzone przez Holodeck nie powinny przekraczać 65535 znaków, chociaż SQL Server przechowuje je w `varchar(max)`.
 
 ### `PULLREQUEST`
 
@@ -350,12 +395,12 @@ Pull Request. `OID` jest PK i FK do `MSG_UNIT.OID`.
 
 | Kolumna | Typ SQL | Wymagane | Znaczenie |
 |---|---|:---:|---|
-| `OID` | `bigint` | PK/FK | Wspolny identyfikator z `MSG_UNIT`. |
-| `MPC` | `varchar(max)` | NULL | Kanal pobierany przez request. |
+| `OID` | `bigint` | PK/FK | Wspólny identyfikator z `MSG_UNIT`. |
+| `MPC` | `varchar(max)` | NULL | Kanał pobierany przez request. |
 
 ### `SELECTPULLREQUEST`
 
-Rozszerzenie Selective Pull Request. Ten sam `OID` musi byc obecny takze w `PULLREQUEST` i `MSG_UNIT`.
+Rozszerzenie Selective Pull Request. Ten sam `OID` musi być obecny także w `PULLREQUEST` i `MSG_UNIT`.
 
 | Kolumna | Typ SQL | Wymagane | Znaczenie |
 |---|---|:---:|---|
@@ -371,33 +416,33 @@ Rozszerzenie Selective Pull Request. Ten sam `OID` musi byc obecny takze w `PULL
 
 ## 6. Klucze obce i constrainty
 
-Nazwane elementy w biezacym modelu:
+Nazwane elementy w bieżącym modelu:
 
 | Constraint | Relacja / warunek |
 |---|---|
 | `UK_PAYLOAD_PAYLOAD_ID` | `PAYLOAD(PAYLOAD_ID)` unique |
-| `UK_UM_PARTNERS_PARTNERS_OID` | `UM_PARTNERS(partners_OID)` unique |
+| `UK_UM_PARTNERS_PARTNERS_OID` | `UM_PARTNERS(PARTNERS_OID)` unique |
 | `FK_MSG_STATE_MSG_UNIT` | `MSG_STATE.MSGUNIT_OID -> MSG_UNIT.OID` |
 | `FK_USER_MESSAGE_MSG_UNIT` | `USER_MESSAGE.OID -> MSG_UNIT.OID` |
 | `FK_ERROR_MESSAGE_MSG_UNIT` | `ERROR_MESSAGE.OID -> MSG_UNIT.OID` |
 | `FK_RECEIPT_MSG_UNIT` | `RECEIPT.OID -> MSG_UNIT.OID` |
 | `FK_PULLREQUEST_MSG_UNIT` | `PULLREQUEST.OID -> MSG_UNIT.OID` |
 | `FK_SELECTPULLREQUEST_PULLREQUEST` | `SELECTPULLREQUEST.OID -> PULLREQUEST.OID` |
-| `FK_PAYLOAD_USER_MESSAGE` | `PAYLOAD.parent_OID -> USER_MESSAGE.OID` |
+| `FK_PAYLOAD_USER_MESSAGE` | `PAYLOAD.PARENT_OID -> USER_MESSAGE.OID` |
 | `FK_PL_PROPERTIES_PAYLOAD` | `PL_PROPERTIES.PAYLOAD_OID -> PAYLOAD.OID` |
-| `FK_ERR_MU_ERRORS_ERROR_MESSAGE` | `ERR_MU_ERRORS.ErrorMessage_OID -> ERROR_MESSAGE.OID` |
-| `FK_UM_PARTNERS_USER_MESSAGE` | `UM_PARTNERS.UserMessage_OID -> USER_MESSAGE.OID` |
-| `FK_UM_PARTNERS_TRADING_PARTNER` | `UM_PARTNERS.partners_OID -> TradingPartner.OID` |
-| `FK_TRADING_PARTNER_PARTY_IDS_TRADING_PARTNER` | `TradingPartner_partyIds.TradingPartner_OID -> TradingPartner.OID` |
-| `FK_UM_PROPERTIES_USER_MESSAGE` | `UM_PROPERTIES.UserMessage_OID -> USER_MESSAGE.OID` |
+| `FK_ERR_MU_ERRORS_ERROR_MESSAGE` | `ERR_MU_ERRORS.ERROR_MESSAGE_OID -> ERROR_MESSAGE.OID` |
+| `FK_UM_PARTNERS_USER_MESSAGE` | `UM_PARTNERS.USER_MESSAGE_OID -> USER_MESSAGE.OID` |
+| `FK_UM_PARTNERS_TRADING_PARTNER` | `UM_PARTNERS.PARTNERS_OID -> TradingPartner.OID` |
+| `FK_TRADING_PARTNER_PARTY_IDS_TRADING_PARTNER` | `TRADING_PARTNER_PARTY_IDS.TRADING_PARTNER_OID -> TradingPartner.OID` |
+| `FK_UM_PROPERTIES_USER_MESSAGE` | `UM_PROPERTIES.USER_MESSAGE_OID -> USER_MESSAGE.OID` |
 
-Zaden z nich nie ma `ON DELETE CASCADE`. SQL Server nie tworzy automatycznie indeksu dla kazdego FK. Hibernate usuwa kolekcje i dzieci we wlasciwej kolejnosci; reczne `DELETE FROM MSG_UNIT` jest niepoprawne i najczesciej zostanie zablokowane przez FK.
+Żaden z nich nie ma `ON DELETE CASCADE`. SQL Server nie tworzy automatycznie indeksu dla każdego FK. Obsługiwany proces retencji usuwa rekordy zależne we właściwej kolejności. Ręczne `DELETE FROM MSG_UNIT` jest poza kontraktem, może pozostawić pliki payloadów i najczęściej zostanie zablokowane przez FK.
 
-## 7. Enumy i kodowanie typow
+## 7. Wartości słownikowe i kodowanie typów
 
-| Miejsce | Reprezentacja | Dopuszczalne wartosci |
+| Miejsce | Reprezentacja | Dopuszczalne wartości |
 |---|---|---|
-| `MSG_UNIT.DIRECTION` | `int`, ordinal Javy | `0=IN`, `1=OUT` |
+| `MSG_UNIT.DIRECTION` | `int` | `0=IN`, `1=OUT` |
 | `PAYLOAD.DIRECTION` | tekst | `IN`, `OUT` |
 | `MSG_STATE.STATE` | tekst | lista z sekcji 4 |
 | `PAYLOAD.CONTAINMENT` | tekst | `BODY`, `ATTACHMENT`, `EXTERNAL` |
@@ -405,82 +450,75 @@ Zaden z nich nie ma `ON DELETE CASCADE`. SQL Server nie tworzy automatycznie ind
 | `ERROR_MESSAGE.LEG` | tekst | `REQUEST`, `REPLY` |
 | `ERR_MU_ERRORS.SEVERITY` | tekst | `warning`, `failure` |
 
-DDL nie ma `CHECK` dla enumow. Nieznana wartosc moze uniemozliwic Hibernate deserializacje calej encji.
+DDL nie ma `CHECK` dla tych list wartości. Nieznana wartość jest nieprawidłowa i może uniemożliwić poprawny odczyt całej wiadomości.
 
-Wszystkie teksty w referencyjnym DDL sa `varchar`, nie `nvarchar`. Porownania, sortowanie, wrazliwosc na wielkosc liter i obsluga znakow spoza strony kodowej wynikaja z collation bazy/kolumn. Nalezy to sprawdzic przed integracja z wielojezycznymi danymi.
+Wszystkie teksty w referencyjnym DDL są `varchar`, nie `nvarchar`. Porównania, sortowanie, wrażliwość na wielkość liter i obsługa znaków spoza strony kodowej wynikają z collation bazy/kolumn. Należy to sprawdzić przed integracją z wielojęzycznymi danymi.
 
-## 8. Rzeczywiste zachowanie aplikacji
+## 8. Cykl życia danych widoczny dla integracji
 
-### Tworzenie wiadomosci
+Ta sekcja opisuje kolejność i stany, które integracja może zaobserwować w bazie i systemie plików. Nie wymaga znajomości sposobu ich realizacji wewnątrz Holodecka.
 
-1. Dla odbieranej wiadomosci `StorageManager` wymusza `DIRECTION=IN` i dodaje stan `RECEIVED`.
-2. Dla wysylanej wymusza `DIRECTION=OUT`.
-3. Wychodzacy User Message i Pull Request bez historii dostaja `SUBMITTED`; tworzone Signale dostaja `CREATED`.
-4. Brakujace `MESSAGE_ID` i `MU_TIMESTAMP` wychodzacej wiadomosci sa uzupelniane przez aplikacje.
-5. Konstruktor encji nadaje losowy `CORE_ID`.
-6. Provider sprawdza unikalnosc `MESSAGE_ID` tylko dla `OUT`, wykonujac najpierw SELECT, a potem INSERT.
-7. Brak constraintu unique oznacza, ze rownolegle transakcje moga przejsc ten check i utworzyc duplikat wychodzacy.
+### Tworzenie wiadomości
 
-Wiadomosci przychodzace nie przechodza kontroli unikalnosci `MESSAGE_ID`. Jest to zamierzone: pozniejsza logika rozpoznaje duplikat na podstawie wczesniej przetworzonych wiadomosci `IN`.
+1. Odebrana wiadomość ma `DIRECTION=IN`, a jej pierwszym stanem jest `RECEIVED`.
+2. Wysyłana wiadomość ma `DIRECTION=OUT`.
+3. Wychodzący User Message i Pull Request bez wcześniejszej historii otrzymują `SUBMITTED`; tworzone Signale otrzymują `CREATED`.
+4. Dla wychodzącej wiadomości oczekiwane są niepuste `MESSAGE_ID`, `MU_TIMESTAMP` i `CORE_ID`.
+5. `MESSAGE_ID` wiadomości przychodzących może się powtarzać. Jest to prawidłowe i służy do rozpoznawania duplikatów.
+6. Dla wiadomości wychodzących oczekiwany jest unikalny `MESSAGE_ID`, ale baza tego nie wymusza. Równoległe operacje mogą więc utworzyć duplikat.
 
-### Aktualizacje i wspolbieznosc
+Integracja nie może wybierać jednego rekordu wyłącznie po `MESSAGE_ID`. Do identyfikacji konkretnej instancji należy używać `CORE_ID`, a ewentualne duplikaty `CORE_ID` monitorować jako naruszenie integralności.
 
-`MSG_UNIT.VERSION` realizuje optimistic locking:
+### Aktualizacje i współbieżność
 
-- odczytana encja niesie aktualny `VERSION`;
-- `merge` i `flush` wykrywaja konkurencyjna aktualizacje;
-- przy konflikcie Holodeck odswieza proxy i moze ponowic decyzje na nowym stanie;
-- bezposredni SQL omija ten mechanizm i moze zgubic aktualizacje lub zepsuc historie stanow.
+`MSG_UNIT.VERSION` jest lokalnym licznikiem zmian jednej wiadomości:
 
-Kazda operacja providera tworzy osobny `EntityManager` i lokalna transakcje. Odczyt z wielu tabel poza jedna transakcja integracji moze polaczyc wersje danych z roznych chwil. Nie uzywac `WITH (NOLOCK)`: moze zwrocic brudne dane, brakujace dzieci, podwojone wiersze albo czesciowo przebudowana kolekcje.
+- zmiana rekordu `MSG_UNIT` zwykle zwiększa `VERSION`;
+- licznik nie porządkuje zmian pomiędzy różnymi wiadomościami;
+- nie obejmuje samodzielnie wszystkich zmian tabel zależnych ani plików;
+- bezpośredni zapis SQL może ominąć kontrolę współbieżności i uszkodzić historię stanów.
 
-Kolekcje `@ElementCollection` nie maja wlasnego ID. Hibernate moze podczas aktualizacji wykonac usuniecie i ponowne wstawienie elementow. CDC na samych tabelach kolekcji nalezy interpretowac jako zmiane snapshotu wlasciciela, nie stabilny strumien zdarzen element-po-elemencie.
+Odczyt z wielu tabel wykonany w niezależnych zapytaniach może połączyć wersje danych z różnych chwil. Dla spójnego obrazu integracja powinna używać jednej transakcji odczytowej z odpowiednim poziomem izolacji. Nie należy używać `WITH (NOLOCK)`, ponieważ może zwrócić brudne dane, brakujące rekordy zależne, podwojone wiersze albo częściowo zmienioną kolekcję.
 
-### Payload zlozony przed wiadomoscia
+Aktualizacja tabel kolekcji, takich jak `UM_PROPERTIES`, `PL_PROPERTIES`, `ERR_MU_ERRORS` i `TRADING_PARTNER_PARTY_IDS`, może być widoczna w CDC jako seria `DELETE` i `INSERT`. Zmiany tych tabel należy interpretować jako nowy snapshot kolekcji właściciela, a nie stabilny strumień zdarzeń element po elemencie.
 
-Holodeck umozliwia zapis payloadu przed zapisem User Message:
+### Payload zapisany przed wiadomością
 
-1. Powstaje `PAYLOAD` z `parent_OID=NULL`, `DIRECTION='OUT'` i `PMODE_ID`.
-2. Tresc jest zapisywana pod `PAYLOAD_ID` w PSP.
-3. Przy zapisie User Message provider odnajduje payload po `PAYLOAD_ID`.
-4. Sprawdza, czy payload nie ma rodzica oraz czy direction i P-Mode zgadzaja sie z wiadomoscia.
-5. Ustawia `parent_OID`.
+Payload może pojawić się przed powiązaniem go z User Message:
 
-Payload utworzony od razu jako czesc wiadomosci moze miec `PAYLOAD.DIRECTION` i `PAYLOAD.PMODE_ID` puste, poniewaz gettery Javy pobieraja je z rodzica. Czytelnik SQL musi stosowac regule wartosci efektywnej z sekcji `PAYLOAD`.
+1. Powstaje rekord `PAYLOAD` z `PARENT_OID=NULL`, `DIRECTION='OUT'` i `PMODE_ID`.
+2. Treść jest zapisywana w pliku nazwanym wartością `PAYLOAD_ID`.
+3. Podczas zapisu User Message istniejący payload jest odnajdywany po `PAYLOAD_ID`.
+4. Jeżeli payload nie ma rodzica, a kierunek i P-Mode są zgodne z wiadomością, ustawiany jest `PARENT_OID`.
+
+Z tego powodu rekord `PAYLOAD` z `PARENT_OID=NULL` nie musi być osierocony — może oczekiwać na powiązanie. Payload utworzony od razu jako część wiadomości może mieć puste `PAYLOAD.DIRECTION` i `PAYLOAD.PMODE_ID`. Integracja musi wtedy stosować regułę wartości efektywnej z sekcji `PAYLOAD`.
 
 ### Usuwanie i retencja
 
-Domyslny worker `cleanupWorker`:
+Domyślny proces retencji:
 
 - startuje po 60 sekundach;
-- uruchamia sie co 3600 sekund;
+- uruchamia się co 3600 sekund;
 - bez parametru `purgeAfterDays` przyjmuje 30 dni;
-- wybiera wiadomosci, ktorych **aktualny** stan ma `START <= cutoff`;
-- nie filtruje stanow finalnych;
-- dla User Message najpierw usuwa pliki payloadow, potem metadane przez JPA.
+- wybiera wiadomości, dla których czas `START` **aktualnego** stanu jest starszy niż granica retencji lub jej równy;
+- nie filtruje stanów finalnych;
+- dla User Message najpierw usuwa pliki payloadów, a potem metadane z bazy.
 
 Konsekwencje:
 
-- dlugo zawieszona lub oczekujaca wiadomosc moze zostac usunieta mimo stanu niefinalnego;
-- czytelnik musi obslugiwac fizyczne znikanie rekordow;
-- gdy usuniecie pliku nie powiedzie sie, metadane pozostaja do kolejnej proby;
-- gdy pliki zostana usuniete, a pozniejsze usuniecie SQL nie powiedzie sie, metadane moga wskazywac na nieistniejaca tresc;
-- bezposrednie skasowanie SQL nie usunie plikow i ominie eventy purge.
+- długo zawieszona lub oczekująca wiadomość może zostać usunięta mimo stanu niefinalnego;
+- integracja musi obsługiwać fizyczne znikanie rekordów i plików;
+- gdy usunięcie pliku nie powiedzie się, metadane pozostają do kolejnej próby;
+- gdy pliki zostaną usunięte, a późniejsze usunięcie SQL nie powiedzie się, metadane mogą wskazywać na nieistniejącą treść;
+- bezpośrednie skasowanie SQL nie usunie plików i naruszy kontrakt retencji.
 
-`purgeAfterDays` ustawia sie jako parametr workera, na przyklad:
-
-```xml
-<worker name="cleanupWorker" interval="3600" activate="true" delay="60"
-        workerClass="org.holodeckb2b.core.workers.PurgeOldMessagesWorker">
-    <parameter name="purgeAfterDays">90</parameter>
-</worker>
-```
+Okres retencji ustala administrator wdrożenia. Wartość domyślna to 30 dni, ale może zostać zmieniona parametrem `purgeAfterDays`. Integracja musi otrzymać rzeczywistą wartość jako część kontraktu operacyjnego; nie powinna odczytywać jej pośrednio ani zakładać wartości domyślnej.
 
 ## 9. Bezpieczne zapytania T-SQL
 
-Przyklady zakladaja schemat `dbo`. Jezeli domyslny schemat uzytkownika Holodecka jest inny, nalezy zmienic kwalifikatory. Parametry takie jak `@message_id` musza byc bindowane przez driver, a nie skladane przez konkatenacje.
+Przykłady zakładają schemat `dbo`. Jeżeli domyślny schemat użytkownika Holodecka jest inny, należy zmienić kwalifikatory. Wartości takie jak `@message_id` muszą być przekazywane jako parametry zapytania przez sterownik bazy, a nie składane przez konkatenację.
 
-### 9.1 Aktualny stan i typ kazdej wiadomosci
+### 9.1 Aktualny stan i typ każdej wiadomości
 
 ```sql
 WITH ranked_state AS (
@@ -526,9 +564,9 @@ LEFT JOIN dbo.PULLREQUEST AS pr ON pr.OID = mu.OID
 LEFT JOIN dbo.SELECTPULLREQUEST AS spr ON spr.OID = mu.OID;
 ```
 
-`ROW_NUMBER` daje jeden rekord nawet przy uszkodzonych duplikatach numeru stanu. Sam Holodeck uzywa `MAX(PROC_STATE_NUM)`, dlatego duplikaty nalezy wykrywac osobnym checkiem, a nie maskowac na stale.
+`ROW_NUMBER` daje jeden rekord nawet przy uszkodzonych duplikatach numeru stanu. Duplikaty należy jednak wykrywać osobnym zapytaniem kontrolnym, a nie na stałe maskować w widoku integracyjnym.
 
-### 9.2 Historia konkretnej wiadomosci
+### 9.2 Historia konkretnej wiadomości
 
 ```sql
 SELECT
@@ -544,7 +582,7 @@ WHERE mu.CORE_ID = @core_id
 ORDER BY s.PROC_STATE_NUM;
 ```
 
-`START` nie jest wystarczajacy do sortowania; dwa stany moga miec ten sam czas.
+`START` nie jest wystarczający do sortowania; dwa stany mogą mieć ten sam czas.
 
 ### 9.3 User Message z danymi biznesowymi
 
@@ -570,7 +608,7 @@ WHERE mu.MESSAGE_ID = @message_id
 ORDER BY mu.MU_TIMESTAMP, mu.OID;
 ```
 
-Zapytanie celowo moze zwrocic wiele wierszy. Jezeli oczekiwany jest jeden rekord, nalezy uzyc `CORE_ID`, a nie `MESSAGE_ID`, i nadal monitorowac ewentualne duplikaty `CORE_ID`.
+Zapytanie celowo może zwrócić wiele wierszy. Jeżeli oczekiwany jest jeden rekord, należy użyć `CORE_ID`, a nie `MESSAGE_ID`, i nadal monitorować ewentualne duplikaty `CORE_ID`.
 
 ### 9.4 Nadawca, odbiorca i PartyId
 
@@ -583,31 +621,31 @@ SELECT
     pid.P_TYPE
 FROM dbo.MSG_UNIT AS mu
 JOIN dbo.USER_MESSAGE AS um ON um.OID = mu.OID
-JOIN dbo.UM_PARTNERS AS up ON up.UserMessage_OID = um.OID
-JOIN dbo.TradingPartner AS tp ON tp.OID = up.partners_OID
-LEFT JOIN dbo.TradingPartner_partyIds AS pid
-    ON pid.TradingPartner_OID = tp.OID
+JOIN dbo.UM_PARTNERS AS up ON up.USER_MESSAGE_OID = um.OID
+JOIN dbo.TradingPartner AS tp ON tp.OID = up.PARTNERS_OID
+LEFT JOIN dbo.TRADING_PARTNER_PARTY_IDS AS pid
+    ON pid.TRADING_PARTNER_OID = tp.OID
 WHERE mu.CORE_ID = @core_id
 ORDER BY up.PARTNERTYPE, pid.P_ID;
 ```
 
-Wiele PartyId partnera jest poprawne. Integracja nie powinna wybierac arbitralnie pierwszego bez uzgodnionej reguly opartej np. na `P_TYPE`.
+Wiele PartyId partnera jest poprawne. Integracja nie powinna wybierać arbitralnie pierwszego bez uzgodnionej reguły opartej np. na `P_TYPE`.
 
-### 9.5 Payloady z wartosciami efektywnymi
+### 9.5 Payloady z wartościami efektywnymi
 
 ```sql
 SELECT
     p.OID,
     p.PAYLOAD_ID,
-    p.parent_OID,
+    p.PARENT_OID,
     mu.CORE_ID AS PARENT_CORE_ID,
     CASE
-        WHEN p.parent_OID IS NOT NULL THEN
+        WHEN p.PARENT_OID IS NOT NULL THEN
             CASE mu.DIRECTION WHEN 0 THEN 'IN' WHEN 1 THEN 'OUT' ELSE 'INVALID' END
         ELSE p.DIRECTION
     END AS EFFECTIVE_DIRECTION,
     CASE
-        WHEN p.parent_OID IS NOT NULL THEN mu.PMODE_ID
+        WHEN p.PARENT_OID IS NOT NULL THEN mu.PMODE_ID
         ELSE p.PMODE_ID
     END AS EFFECTIVE_PMODE_ID,
     p.CONTAINMENT,
@@ -619,14 +657,14 @@ SELECT
     p.NAMESPACE AS SCHEMA_NAMESPACE,
     p.VERSION AS SCHEMA_VERSION
 FROM dbo.PAYLOAD AS p
-LEFT JOIN dbo.USER_MESSAGE AS um ON um.OID = p.parent_OID
+LEFT JOIN dbo.USER_MESSAGE AS um ON um.OID = p.PARENT_OID
 LEFT JOIN dbo.MSG_UNIT AS mu ON mu.OID = um.OID
 WHERE mu.CORE_ID = @core_id OR p.PAYLOAD_ID = @payload_id;
 ```
 
-Odczyt pliku wymaga konfiguracji PSP. Nie nalezy zakladac, ze wspoldzielony filesystem istnieje ani ze uzywana jest domyslna implementacja providera.
+Odczyt treści wymaga dostępu do uzgodnionego katalogu payloadów. Nie należy zakładać, że katalog jest lokalny, współdzielony ani dostępny pod ścieżką domyślną.
 
-### 9.6 Error Signal i bledy ebMS
+### 9.6 Error Signal i błędy ebMS
 
 ```sql
 SELECT
@@ -646,15 +684,15 @@ SELECT
     e.DESCRIPTION_TXT
 FROM dbo.MSG_UNIT AS mu
 JOIN dbo.ERROR_MESSAGE AS em ON em.OID = mu.OID
-LEFT JOIN dbo.ERR_MU_ERRORS AS e ON e.ErrorMessage_OID = em.OID
+LEFT JOIN dbo.ERR_MU_ERRORS AS e ON e.ERROR_MESSAGE_OID = em.OID
 WHERE mu.CORE_ID = @core_id;
 ```
 
-`MSG_UNIT.REF_TO_MSG_ID` opisuje relacje calego signalu, a `ERR_MU_ERRORS.REF_TO_MSG_IN_ERROR` relacje pojedynczego bledu. Obie sa tekstowe i nie maja FK.
+`MSG_UNIT.REF_TO_MSG_ID` opisuje relację całego signalu, a `ERR_MU_ERRORS.REF_TO_MSG_IN_ERROR` relację pojedynczego błędu. Obie są tekstowe i nie mają FK.
 
-### 9.7 Proby transmisji
+### 9.7 Próby transmisji
 
-Tak samo liczy je domyslny provider:
+Liczbę prób transmisji jednej instancji wiadomości można wyznaczyć następująco:
 
 ```sql
 SELECT COUNT_BIG(*) AS TRANSMISSION_COUNT
@@ -665,12 +703,12 @@ WHERE mu.CORE_ID = @core_id
   AND s.STATE = 'SENDING';
 ```
 
-Kod Holodecka filtruje wewnetrznie po `MESSAGE_ID`, nie `CORE_ID`. Dla danych z duplikatem wychodzacym moze zsumowac transmisje kilku rekordow. Integracji zaleca sie `CORE_ID`, jezeli chodzi o jedna instancje.
+Zapytanie używa `CORE_ID`, ponieważ `MESSAGE_ID` może wskazywać kilka rekordów i zsumować transmisje różnych instancji wiadomości.
 
-### 9.8 Kontrole integralnosci
+### 9.8 Kontrole integralności
 
 ```sql
--- Brak lub wiele typow potomnych dla MSG_UNIT.
+-- Brak lub wiele typów potomnych dla MSG_UNIT.
 SELECT mu.OID, mu.CORE_ID,
        (CASE WHEN um.OID IS NULL THEN 0 ELSE 1 END
         + CASE WHEN em.OID IS NULL THEN 0 ELSE 1 END
@@ -707,7 +745,7 @@ WHERE STATE IS NOT NULL
       'SUSPENDED', 'DELIVERED', 'DONE', 'FAILURE', 'DUPLICATE'
   );
 
--- Duplikaty CORE_ID i wychodzacego MESSAGE_ID.
+-- Duplikaty CORE_ID i wychodzącego MESSAGE_ID.
 SELECT CORE_ID, COUNT_BIG(*) AS CNT
 FROM dbo.MSG_UNIT
 WHERE CORE_ID IS NOT NULL
@@ -725,46 +763,59 @@ HAVING COUNT_BIG(*) > 1;
 
 ### Zalecany kontrakt
 
-Najstabilniejszy uklad dla silnie zintegrowanych projektow:
+Najstabilniejszy układ dla integracji przez bazę i system plików:
 
-1. Konto Holodecka ma prawa DDL/DML potrzebne Hibernate.
-2. Oddzielne konto integracyjne ma tylko `SELECT` na zatwierdzonych widokach.
-3. Widoki znajduja sie w osobnym schemacie, np. `integration`, i zwracaja nazwy domenowe zamiast surowych ordinali.
-4. Widoki maja wlasna wersje kontraktu, np. `integration.v1_message_current`.
-5. Zmiana wersji Holodecka uruchamia automatyczne porownanie schematu i testy zapytan kontraktowych.
-6. Tresc payloadu jest pobierana przez uzgodnione API/usluge, a nie przez sciezke wyliczona z SQL, chyba ze domyslny filesystem PSP jest formalnie czescia kontraktu wdrozenia.
+1. Oddzielne konto integracyjne ma tylko `SELECT` na zatwierdzonych widokach.
+2. Widoki znajdują się w osobnym schemacie, np. `integration`, i zwracają nazwy domenowe zamiast surowych wartości liczbowych.
+3. Widoki mają własną wersję kontraktu, np. `integration.v1_message_current`.
+4. Integracja ma wyłącznie prawo odczytu do dokładnie wskazanego katalogu payloadów.
+5. Widok lub zapytanie payloadów zwraca `PAYLOAD_ID`; integracja buduje ścieżkę wyłącznie jako `<uzgodniony katalog>/<PAYLOAD_ID>`.
+6. Katalog i baza muszą pochodzić z tej samej instancji oraz tego samego środowiska Holodecka.
+7. Zmiana wersji Holodecka uruchamia porównanie schematu, testy zapytań kontraktowych i test korelacji rekord–plik.
 
-Bezposrednie zapisy do tabel sa niewspierane. Dotyczy to rowniez pozornie prostego dopisania `MSG_STATE`: wymaga ono zgodnego `PROC_STATE_NUM`, czasu, aktualizacji `MSG_UNIT.VERSION`, poprawnego stanu proxy i transakcji JPA.
+Bezpośrednie zapisy do tabel i plików są poza kontraktem. Dotyczy to również pozornie prostego dopisania `MSG_STATE`, podmiany pliku lub usunięcia rekordu `PAYLOAD`: każda z tych operacji może naruszyć historię, retencję albo spójność pomiędzy oboma źródłami.
 
-### Izolacja i obciazenie
+### Izolacja i obciążenie
 
-- Preferowac read-only replike lub raportowa kopie bazy, jezeli opoznienie jest akceptowalne.
-- Na bazie podstawowej rozwazyc z DBA `READ_COMMITTED_SNAPSHOT`; nie wlaczac go bez oceny calego workloadu.
-- Dla wielotabelowego snapshotu uzywac jednej transakcji `SNAPSHOT`/RCSI zamiast wielu niezaleznych SELECT-ow.
-- Nie uzywac `NOLOCK`.
-- Stronicowac stabilnie po `(MU_TIMESTAMP, OID)` albo `OID`, nie tylko po czasie.
-- Ustalac timeout i limit wyniku. Tabele LOB (`varchar(max)`) wybierac tylko wtedy, gdy sa potrzebne.
-- Nie wykonywac cyklicznie pelnego skanu historii `MSG_STATE` z aplikacji integracyjnej.
+- Preferować replikę tylko do odczytu lub raportową kopię bazy, jeżeli opóźnienie jest akceptowalne.
+- Na bazie podstawowej rozważyć z DBA `READ_COMMITTED_SNAPSHOT`; nie włączać go bez oceny całego workloadu.
+- Dla wielotabelowego snapshotu używać jednej transakcji `SNAPSHOT`/RCSI zamiast wielu niezależnych zapytań `SELECT`.
+- Nie używać `NOLOCK`.
+- Stronicować stabilnie po `(MU_TIMESTAMP, OID)` albo `OID`, nie tylko po czasie.
+- Ustalać timeout i limit wyniku. Tabele LOB (`varchar(max)`) wybierać tylko wtedy, gdy są potrzebne.
+- Nie wykonywać cyklicznie pełnego skanu historii `MSG_STATE` z aplikacji integracyjnej.
 
 ### Odczyt przyrostowy
 
-`OID` nadaje sie do wykrywania nowych encji, ale nie aktualizacji. `VERSION` jest licznikiem lokalnym dla jednego `MSG_UNIT`, nie globalnym offsetem. `START` pochodzi z zegara JVM, nie z SQL Servera, i moze sie powtarzac lub cofnac.
+`OID` nadaje się do wykrywania nowych rekordów, ale nie aktualizacji. `VERSION` jest licznikiem lokalnym dla jednego `MSG_UNIT`, nie globalnym offsetem. `START` pochodzi z zegara instancji Holodecka, nie z SQL Servera, i może się powtarzać lub cofnąć.
 
-Mozliwe strategie, od najbardziej kontrolowanej:
+Możliwe strategie, od najbardziej kontrolowanej:
 
-1. Wlasna tabela outbox/eventy tworzone w warstwie aplikacyjnej Holodecka.
-2. SQL Server Change Tracking lub CDC na `MSG_UNIT`, `MSG_STATE` i tabelach domenowych, z testami na zachowanie Hibernate wobec kolekcji.
-3. Polling z nakladajacym sie oknem czasu, kluczem deduplikacji `(MSGUNIT_OID, PROC_STATE_NUM)` i okresowym reconciliation pelnego snapshotu.
-4. Polling mapy `(OID -> VERSION)` dla aktywnych wiadomosci, uzupelniony obsluga fizycznych usuniec.
+1. Wersjonowana tabela zdarzeń lub outbox udostępniona w tej samej bazie jako część kontraktu integracyjnego.
+2. SQL Server Change Tracking lub CDC na `MSG_UNIT`, `MSG_STATE` i tabelach domenowych, z interpretacją zmian kolekcji jako pełnych snapshotów.
+3. Polling z nakładającym się oknem czasu, kluczem deduplikacji `(MSGUNIT_OID, PROC_STATE_NUM)` i okresowym uzgadnianiem pełnego snapshotu.
+4. Polling mapy `(OID -> VERSION)` dla aktywnych wiadomości, uzupełniony obsługą fizycznych usunięć.
 
-Sam watermark `MAX(MSG_STATE.START)` nie jest bezpieczny. Retencja oznacza, ze integracja musi obslugiwac delete/tombstone albo posiadac wlasny, trwaly snapshot.
+Sam watermark `MAX(MSG_STATE.START)` nie jest bezpieczny. Retencja oznacza, że integracja musi obsługiwać informację o usunięciu albo posiadać własny, trwały snapshot.
+
+### Łączenie odczytu przyrostowego z plikami
+
+Rekord i plik mogą stać się widoczne w różnym czasie. Dla każdego nowego `PAYLOAD_ID` integracja powinna:
+
+1. odczytać metadane i wyznaczyć oczekiwany plik;
+2. sprawdzić istnienie pliku oraz możliwość jego otwarcia do odczytu;
+3. jeżeli pliku jeszcze nie ma, ponawiać próbę przez uzgodnione okno tolerancji;
+4. po upływie okna zgłosić metadane bez treści jako błąd integralności;
+5. deduplikować przetwarzanie po `PAYLOAD_ID`, a nie po nazwie katalogu ani `URI`.
+
+Plik bez rekordu `PAYLOAD` nie jest samodzielną wiadomością i nie powinien być przekazywany dalej. Należy go raportować jako osierocony dopiero po uwzględnieniu uzgodnionego okna tolerancji oraz trwającej retencji.
 
 ## 11. Indeksy dla integracji
 
-Referencyjny DDL ma PK, dwa unique constrainty i FK, ale nie definiuje indeksow pod najczestsze zapytania Holodecka. SQL Server nie dodaje automatycznie indeksow po stronie kolumn FK. Ponizsze propozycje sa punktem wyjscia, nie gotowa migracja; trzeba sprawdzic istniejace indeksy, rozmiar danych i plany wykonania.
+Referencyjny DDL ma PK, dwa unique constrainty i FK, ale nie definiuje indeksów pod najczęstsze zapytania integracyjne. SQL Server nie dodaje automatycznie indeksów po stronie kolumn FK. Poniższe propozycje są punktem wyjścia dla administratora bazy, nie gotową migracją; przed ich zastosowaniem trzeba sprawdzić istniejące indeksy, rozmiar danych i plany wykonania.
 
 ```sql
--- Aktualny stan oraz ladowanie historii jednego MSG_UNIT.
+-- Aktualny stan oraz ładowanie historii jednego MSG_UNIT.
 CREATE INDEX IX_MSG_STATE_MSGUNIT_SEQ
     ON dbo.MSG_STATE (MSGUNIT_OID, PROC_STATE_NUM DESC)
     INCLUDE (STATE, START, DESCRIPTION);
@@ -774,59 +825,57 @@ CREATE INDEX IX_MSG_UNIT_MESSAGE_DIRECTION
     ON dbo.MSG_UNIT (MESSAGE_ID, DIRECTION)
     INCLUDE (OID, CORE_ID, MU_TIMESTAMP, PMODE_ID, VERSION);
 
--- Lookup po CoreId. Najpierw sprawdzic duplikaty; UNIQUE tylko po oczyszczeniu danych.
+-- Lookup po CoreId. Najpierw sprawdzić duplikaty; UNIQUE tylko po oczyszczeniu danych.
 CREATE INDEX IX_MSG_UNIT_CORE_ID
     ON dbo.MSG_UNIT (CORE_ID)
     INCLUDE (OID, MESSAGE_ID, DIRECTION, MU_TIMESTAMP, PMODE_ID, VERSION);
 
--- Powiazanie payloadow z User Message.
+-- Powiązanie payloadów z User Message.
 CREATE INDEX IX_PAYLOAD_PARENT
-    ON dbo.PAYLOAD (parent_OID)
+    ON dbo.PAYLOAD (PARENT_OID)
     INCLUDE (PAYLOAD_ID, URI, MIME_TYPE, CONTAINMENT);
 
--- Joiny tabel kolekcji, jezeli nie pokrywaja ich indeksy constraintow.
+-- Joiny tabel kolekcji, jeżeli nie pokrywają ich indeksy constraintów.
 CREATE INDEX IX_UM_PROPERTIES_USER_MESSAGE
-    ON dbo.UM_PROPERTIES (UserMessage_OID);
+    ON dbo.UM_PROPERTIES (USER_MESSAGE_OID);
 
 CREATE INDEX IX_PL_PROPERTIES_PAYLOAD
     ON dbo.PL_PROPERTIES (PAYLOAD_OID);
 
 CREATE INDEX IX_ERR_MU_ERRORS_ERROR_MESSAGE
-    ON dbo.ERR_MU_ERRORS (ErrorMessage_OID);
+    ON dbo.ERR_MU_ERRORS (ERROR_MESSAGE_OID);
 
 CREATE INDEX IX_PARTY_IDS_PARTNER
-    ON dbo.TradingPartner_partyIds (TradingPartner_OID);
+    ON dbo.TRADING_PARTNER_PARTY_IDS (TRADING_PARTNER_OID);
 ```
 
-Nie tworzyc globalnego unique na `MESSAGE_ID`: przychodzace duplikaty sa elementem modelu. Ewentualny filtrowany unique dla `DIRECTION=1` wymaga najpierw analizy race condition, istniejacych danych i zgodnosci z przyszlymi wersjami Holodecka.
+Nie tworzyć globalnego unique na `MESSAGE_ID`: przychodzące duplikaty są elementem modelu. Ewentualny filtrowany unique dla `DIRECTION=1` wymaga najpierw analizy race condition, istniejących danych i zgodności z przyszłymi wersjami Holodecka.
 
-## 12. Backup, odtwarzanie i bezpieczenstwo
+## 12. Backup, odtwarzanie i bezpieczeństwo
 
-### Spojnosc backupu
+### Spójność backupu
 
-Kompletny backup wdrozenia obejmuje co najmniej:
+Kompletny backup wdrożenia obejmuje co najmniej:
 
-- baze SQL Server;
-- katalog/zasob providera payloadow;
-- konfiguracje P-Mode i konfiguracje runtime poza baza;
+- bazę SQL Server;
+- katalog lub udział sieciowy z payloadami;
+- konfigurację P-Mode i konfigurację działania instancji poza bazą;
 - informacje o wersji aplikacji i schematu.
 
-Backup bazy i plikow wykonany w roznych chwilach nie jest atomowy. Dla scislej spojnosci trzeba zatrzymac przyjmowanie/przetwarzanie wiadomosci albo zastosowac koordynowany mechanizm snapshotow. Po restore nalezy skontrolowac oba kierunki: `PAYLOAD_ID` bez tresci oraz pliki bez `PAYLOAD_ID`.
+Backup bazy i plików wykonany w różnych chwilach nie jest atomowy. Dla ścisłej spójności trzeba zatrzymać przyjmowanie/przetwarzanie wiadomości albo zastosować koordynowany mechanizm snapshotów. Po restore należy skontrolować oba kierunki: `PAYLOAD_ID` bez treści oraz pliki bez `PAYLOAD_ID`.
 
-### Uprawnienia i dane wrazliwe
+### Uprawnienia i dane wrażliwe
 
-- Konto integracyjne: `SELECT` na widokach, bez `INSERT`, `UPDATE`, `DELETE`, `ALTER` i `EXECUTE` niezbednego do modyfikacji.
-- Sekrety DB przekazywac przez bezpieczny secret store, nie umieszczac w repozytorium ani logach.
-- Wymusic TLS w JDBC URL zgodnie z polityka wdrozenia.
-- `ERROR_DETAIL`, opisy stanow, properties, Receipt XML i payloady moga zawierac dane biznesowe lub diagnostyczne wrazliwe.
-- Logi integracji nie powinny zapisywac pelnej tresci LOB ani payloadow bez redakcji.
-- Retencje i backupy uzgodnic z wymaganiami audytowymi; domyslne 30 dni moze byc zbyt krotkie.
+- Konto integracyjne ma `SELECT` na zatwierdzonych widokach, bez uprawnień `INSERT`, `UPDATE`, `DELETE`, `ALTER` ani innych uprawnień pozwalających modyfikować dane lub schemat.
+- Sekrety DB przekazywać przez bezpieczny secret store, nie umieszczać w repozytorium ani logach.
+- Wymusić TLS dla połączenia z SQL Serverem zgodnie z polityką wdrożenia.
+- `ERROR_DETAIL`, opisy stanów, properties, Receipt XML i payloady mogą zawierać dane biznesowe lub diagnostyczne wrażliwe.
+- Logi integracji nie powinny zapisywać pełnej treści LOB ani payloadów bez redakcji.
+- Retencję i backupy uzgodnić z wymaganiami audytowymi; domyślny okres 30 dni może być zbyt krótki.
 
-Modul core/default-mds jest objety GPLv3, a publiczny modul interfaces LGPLv3. Przy osadzaniu kodu lub kopiowaniu implementacji nalezy przeprowadzic osobna ocene licencyjna; sam ten dokument nie jest porada prawna.
+## 13. Weryfikacja schematu wdrożenia
 
-## 13. Weryfikacja schematu wdrozenia
-
-### Obiekty i domyslny schemat
+### Obiekty i domyślny schemat
 
 ```sql
 SELECT
@@ -837,7 +886,7 @@ FROM sys.objects AS o
 JOIN sys.schemas AS s ON s.schema_id = o.schema_id
 WHERE o.name IN (
     'MSG_UNIT', 'MSG_STATE', 'USER_MESSAGE', 'UM_PARTNERS',
-    'TradingPartner', 'TradingPartner_partyIds', 'UM_PROPERTIES',
+    'TradingPartner', 'TRADING_PARTNER_PARTY_IDS', 'UM_PROPERTIES',
     'PAYLOAD', 'PL_PROPERTIES', 'ERROR_MESSAGE', 'ERR_MU_ERRORS',
     'RECEIPT', 'PULLREQUEST', 'SELECTPULLREQUEST', 'hibernate_sequence'
 )
@@ -864,7 +913,7 @@ JOIN sys.columns AS c ON c.object_id = t.object_id
 JOIN sys.types AS ty ON ty.user_type_id = c.user_type_id
 WHERE t.name IN (
     'MSG_UNIT', 'MSG_STATE', 'USER_MESSAGE', 'UM_PARTNERS',
-    'TradingPartner', 'TradingPartner_partyIds', 'UM_PROPERTIES',
+    'TradingPartner', 'TRADING_PARTNER_PARTY_IDS', 'UM_PROPERTIES',
     'PAYLOAD', 'PL_PROPERTIES', 'ERROR_MESSAGE', 'ERR_MU_ERRORS',
     'RECEIPT', 'PULLREQUEST', 'SELECTPULLREQUEST'
 )
@@ -894,39 +943,43 @@ JOIN sys.columns AS rc
 ORDER BY schema_name, fk.name, fkc.constraint_column_id;
 ```
 
-Wynik tych zapytan warto eksportowac w CI/CD i porownywac z zaakceptowanym snapshotem. Lokalny `holodeckb2b-schema.sql` jest pomocniczym wygenerowanym DDL i jest ignorowany przez `.gitignore`; nie nalezy traktowac go jako mechanizmu migracji ani dowodu stanu konkretnej bazy.
+Wynik tych zapytań warto eksportować w CI/CD i porównywać z zaakceptowanym snapshotem. Snapshot powinien zawierać datę, wersję Holodecka i identyfikator środowiska. Plik DDL przechowywany poza aktywną bazą jest tylko materiałem pomocniczym i nie stanowi dowodu stanu konkretnego wdrożenia.
 
 ## 14. Checklista przed uruchomieniem integracji
 
-- [ ] Potwierdzono wersje Holodecka, Hibernate, JDBC drivera i commit/build obrazu.
+- [ ] Potwierdzono wersję Holodecka i środowisko, z którego pochodzą baza oraz katalog payloadów.
 - [ ] Zinwentaryzowano faktyczny schemat, constrainty, indeksy, collation i poziom compatibility SQL Servera.
-- [ ] Konto integracyjne ma tylko niezbedne prawa odczytu.
-- [ ] Uzgodniono, czy odczyt jest z primary, repliki czy eksportu.
-- [ ] Uzgodniono izolacje transakcji i zakazano `NOLOCK`.
-- [ ] Typ wiadomosci jest rozpoznawany po tabelach potomnych, z pierwszenstwem Selective Pull.
+- [ ] Zapisano zaakceptowany snapshot schematu wraz z datą i identyfikatorem środowiska.
+- [ ] Konto integracyjne ma wyłącznie niezbędne prawa odczytu.
+- [ ] Uzgodniono, czy odczyt jest z bazy podstawowej, repliki czy eksportu.
+- [ ] Uzgodniono izolację transakcji i zakazano `NOLOCK`.
+- [ ] Wskazano bezwzględną ścieżkę katalogu payloadów należącego do tej samej instancji.
+- [ ] Konto integracyjne może czytać i listować payloady, ale nie może ich modyfikować ani usuwać.
+- [ ] Przetestowano korelację `PAYLOAD.PAYLOAD_ID` → `<katalog>/<PAYLOAD_ID>`.
+- [ ] Potwierdzono, że `PAYLOAD.URI` nie jest używany jako lokalna ścieżka.
+- [ ] Typ wiadomości jest rozpoznawany po tabelach potomnych, z pierwszeństwem Selective Pull.
 - [ ] Kierunek `MSG_UNIT` jest mapowany z `0/1`, a kierunek `PAYLOAD` z tekstu.
-- [ ] Aktualny stan jest wyznaczany po `MAX(PROC_STATE_NUM)`.
-- [ ] Integracja toleruje wiele rekordow dla `MESSAGE_ID`.
-- [ ] Rozrozniono `MSG_UNIT.PMODE_ID` i osadzone `P_MODE_ID` AgreementRef.
-- [ ] Payload korzysta z efektywnego direction/P-Mode rodzica.
-- [ ] Zaprojektowano dostep do tresci payloadu poza SQL.
-- [ ] Uzgodniono retencje `cleanupWorker` i sposob obslugi usuniec.
-- [ ] Strategia przyrostowa nie opiera sie tylko na `START` ani tylko na `VERSION`.
-- [ ] Backup obejmuje baze, payload storage i konfiguracje P-Mode.
-- [ ] Testy integralnosci z sekcji 9.8 sa monitorowane.
-- [ ] Zmiana wersji Holodecka blokuje rollout do czasu przejscia testow kontraktowych.
+- [ ] Aktualny stan jest wyznaczany po największym `PROC_STATE_NUM`.
+- [ ] Integracja toleruje wiele rekordów dla `MESSAGE_ID`.
+- [ ] Rozróżniono `MSG_UNIT.PMODE_ID` i osadzone `P_MODE_ID` AgreementRef.
+- [ ] Payload korzysta z efektywnego kierunku i P-Mode rodzica.
+- [ ] Uzgodniono okno tolerancji na opóźnienie pomiędzy rekordem a plikiem.
+- [ ] Uzgodniono retencję i sposób obsługi fizycznych usunięć.
+- [ ] Strategia przyrostowa nie opiera się tylko na `START` ani tylko na `VERSION`.
+- [ ] Backup obejmuje bazę, katalog payloadów i konfigurację P-Mode.
+- [ ] Testy integralności z sekcji 9.8 oraz korelacji rekord–plik są monitorowane.
+- [ ] Zmiana wersji Holodecka blokuje wdrożenie integracji do czasu przejścia testów kontraktowych.
 
-## 15. Zrodla w repozytorium
+## 15. Utrzymanie kontraktu
 
-Najwazniejsze pliki, z ktorych wynika opis:
+Integrator nie musi znać implementacji Holodecka ani analizować jego kodu źródłowego. Utrzymanie kontraktu opiera się na obserwowalnych elementach wdrożenia:
 
-- polaczenie i ustawienia Hibernate: [`DatabaseConfiguration.java`](modules/holodeckb2b-default-mds/src/main/java/org/holodeckb2b/storage/metadata/DatabaseConfiguration.java);
-- transakcje, zapytania i optimistic locking: [`DefaultMetadataStorageProvider.java`](modules/holodeckb2b-default-mds/src/main/java/org/holodeckb2b/storage/metadata/DefaultMetadataStorageProvider.java);
-- encje i mapowania: [`jpa/`](modules/holodeckb2b-default-mds/src/main/java/org/holodeckb2b/storage/metadata/jpa/);
-- koordynacja metadanych i payloadow: [`StorageManager.java`](modules/holodeckb2b-core/src/main/java/org/holodeckb2b/core/storage/StorageManager.java);
-- semantyka zapytan Core: [`QueryManager.java`](modules/holodeckb2b-core/src/main/java/org/holodeckb2b/core/storage/QueryManager.java);
-- filesystem payload storage: [`DefaultPayloadStorageProvider.java`](modules/holodeckb2b-default-psp/src/main/java/org/holodeckb2b/storage/payloads/DefaultPayloadStorageProvider.java);
-- retencja: [`PurgeOldMessagesWorker.java`](modules/holodeckb2b-core/src/main/java/org/holodeckb2b/core/workers/PurgeOldMessagesWorker.java) i [`workers.xml`](modules/holodeckb2b-distribution/basedir/conf/workers.xml);
-- wartosci stanow: [`ProcessingState.java`](modules/holodeckb2b-interfaces/src/main/java/org/holodeckb2b/interfaces/processingmodel/ProcessingState.java).
+- katalogu systemowym aktywnej bazy SQL Server;
+- zatwierdzonym snapshotcie schematu;
+- aktywnej konfiguracji katalogu payloadów;
+- kontroli obecności plików wskazanych przez `PAYLOAD_ID`;
+- testach zapytań i reguł integralności opisanych w tym dokumencie.
 
-Przy rozbieznosci pomiedzy tym dokumentem, lokalnym DDL i aktywna baza nalezy przyjac, ze stan aktywnej bazy jest faktem operacyjnym, a biezace mapowania JPA sa zrodlem oczekiwan aplikacji. Rozbieznosc trzeba wyjasnic przed restartem Holodecka, poniewaz `hbm2ddl.auto=update` moze podjac probe modyfikacji schematu.
+Po każdej aktualizacji Holodecka administrator powinien dostarczyć nowy snapshot schematu i potwierdzić, że reguła nazwa pliku = `PAYLOAD_ID`, katalog payloadów, kolejność retencji oraz wartości stanów nie uległy zmianie. Do czasu takiego potwierdzenia integracja nie powinna uznawać nowej wersji za zgodną.
+
+Przy rozbieżności pomiędzy tym dokumentem a aktywnym wdrożeniem faktem operacyjnym są dane widoczne w bazie, aktywna konfiguracja katalogu oraz rzeczywista zawartość systemu plików. Rozbieżność trzeba wyjaśnić i zaakceptować jako nową wersję kontraktu; nie należy korygować danych ani plików bezpośrednio.
